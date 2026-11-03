@@ -1,0 +1,7 @@
+{
+  "name": "tiassh-build-tools",
+  "private": true,
+  "license": "WTFPL",
+  "scripts": { "test:compat": "node --test ../tests/client/compatibility.test.js" },
+  "devDependencies": { "acorn": "8.14.1", "esbuild": "0.25.0" }
+}
