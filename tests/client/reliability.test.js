@@ -79,6 +79,29 @@ test('logout stops reconnect loop and clears ws retry timer',()=>{
   assert.equal(c.timers.size,0);
   assert.equal(c.run('state.wsStopped'),true);
 });
+
+test('offline mode toggles host-write button disabled state',()=>{
+  const c=client();
+  c.run("setOfflineMode(true)");
+  assert.equal(c.run("$('addHostBtn').disabled"), true);
+  c.run("setOfflineMode(false)");
+  assert.equal(c.run("$('addHostBtn').disabled"), false);
+});
+
+test('websocket close while lease valid enters offline read-only mode',()=>{
+  const c=client();
+  const now=Date.now();
+  c.context.now = now;
+  c.run("state.token='t'; state.issuedAt=now-1000; state.expiresAt=now+100000; state.key={}; openWs(); state.ws.onclose({code:1006});");
+  assert.equal(c.run('state.offlineMode'), true);
+  assert.equal(c.run('state.readOnly'), true);
+});
+
+test('host add modal does not open while read-only',()=>{
+  const c=client();
+  c.run("$('modal').innerHTML='sentinel'; state.readOnly=true; hostModal(null);");
+  assert.equal(c.run("$('modal').innerHTML"), 'sentinel');
+});
 test('Android secure local WebView explicitly permits self-hosted cleartext mixed content',()=>{
   const config=JSON.parse(fs.readFileSync(path.join(root,'android/capacitor.config.json')));
   assert.equal(config.server.androidScheme,'https');

@@ -132,6 +132,85 @@ function makeClient({ fetchImpl } = {}) {
   };
 }
 
+test('offline lease detects clock rollback across restarts and rejects malformed/overlong leases', () => {
+  const c = makeClient();
+  const now = Date.now();
+  c.ctx.now = now;
+  c.run('state.issuedAt=now-1000; state.expiresAt=now+100000; state.leaseSeenAt=now; saveSession()');
+  const stored = JSON.parse(c.storage.get('tiassh_session'));
+  assert.equal(stored.leaseSeenAt, now);
+  c.ctx.stored = stored;
+  assert.equal(c.run('leaseValid(stored, now-1)'), false);
+  assert.equal(c.run('leaseValid({issuedAt:now-36*3600000,expiresAt:now+3600000},now)'), false);
+  assert.equal(c.run('leaseValid({issuedAt:String(now-1000),expiresAt:now+100000},now)'), false);
+  assert.equal(c.run('leaseValid({issuedAt:now+1,expiresAt:now+100000},now)'), false);
+});
+
+test('cache helpers isolate server/account and store only ciphertext fields', () => {
+  const c = makeClient();
+  c.run("state.email='u@e'; state.salt='c2FsdA=='; saveSnapshotCache([{category:'host',key:'h',value:'cipher',password:'secret',host:'plaintext'}],12)");
+  const cache = JSON.parse(c.storage.get('tiassh_snapshot_cache'));
+  assert.equal(JSON.stringify(cache).includes('secret'), false);
+  assert.equal(JSON.stringify(cache).includes('plaintext'), false);
+  assert.equal(c.run('loadSnapshotCache().items[0].value'), 'cipher');
+  c.run("state.email='other'");
+  assert.equal(c.run('loadSnapshotCache()'), null);
+  c.storage.set('tiassh_snapshot_cache', '{');
+  assert.equal(c.run('loadSnapshotCache()'), null);
+});
+
+test('lease timer logs out and clears decrypted state without a restart', () => {
+  const c = makeClient();
+  c.run("state.token='t'; state.key={}; state.issuedAt=Date.now()-1000; state.expiresAt=Date.now()+100; state.hosts.set('h',{password:'secret'}); scheduleLeaseExpiry()");
+  c.tick(100);
+  assert.equal(c.run('state.token'), null);
+  assert.equal(c.run('state.key'), null);
+  assert.equal(c.run('state.hosts.size'), 0);
+  assert.equal(c.run("$('authLoginFields').classList.contains('hidden')"), false);
+});
+
+test('server authentication rejection cannot fall back to offline cache', async () => {
+  const c = makeClient({fetchImpl: async () => ({ok:false,status:401,json:async()=>({error:'unauthorized'})})});
+  c.run("state.token='t'; state.email='u@e'; state.salt='c2FsdA=='; state.issuedAt=Date.now()-1000; state.expiresAt=Date.now()+100000; saveSession(); saveSnapshotCache([],1)");
+  assert.equal(await c.run('tryAutoLogin()'), false);
+  assert.equal(c.run('state.token'), null);
+  assert.equal(c.storage.has('tiassh_snapshot_cache'), false);
+});
+
+test('recovery rejects an already expired server lease instead of enabling writes', async () => {
+  const now = Date.now();
+  const c = makeClient({fetchImpl: async () => ({ok:true,json:async()=>({email:'u@e',salt:'c2FsdA==',issuedAt:now-1000,expiresAt:now-1})})});
+  c.run("state.token='t'; state.email='u@e'; state.salt='c2FsdA=='; state.issuedAt=Date.now()-1000; state.expiresAt=Date.now()+100000; setOfflineMode(true)");
+  assert.equal(await c.run('recoverOnlineIfPossible()'), false);
+  assert.equal(c.run('state.token'), null);
+});
+
+test('host save and delete handlers remain inert if offline begins with modal open', async () => {
+  const c = makeClient();
+  c.run("state.hosts.set('h',{id:'h',name:'n',host:'x',user:'root'}); hostModal(state.hosts.get('h')); setOfflineMode(true)");
+  await c.run("$('f_save').onclick()");
+  c.run("$('f_del').onclick()");
+  assert.equal(c.run("state.hosts.get('h').host"), 'x');
+  assert.equal(c.fetchCalls.length, 0);
+  assert.equal(c.run("$('offlineBanner').classList.contains('hidden')"), false);
+  assert.match(fs.readFileSync(path.join(root,'web/index.html'),'utf8'), /id="offlineBanner"/);
+});
+
+test('auto-login rejects clock rollback using persisted lease watermark before network', async () => {
+  const c = makeClient();
+  const now = Date.now();
+  c.storage.set('tiassh_session', JSON.stringify({token:'t',email:'u@e',salt:'c2FsdA==',issuedAt:now-1000,expiresAt:now+100000,leaseSeenAt:now+5000}));
+  assert.equal(await c.run('tryAutoLogin()'), false);
+  assert.equal(c.fetchCalls.length, 0);
+});
+
+test('expiry clears decrypted host and modal DOM as well as memory', () => {
+  const c = makeClient();
+  c.run("$('hostList').innerHTML='secret'; $('modal').innerHTML='password'; logoutSession()");
+  assert.equal(c.run("$('hostList').innerHTML"), '');
+  assert.equal(c.run("$('modal').innerHTML"), '');
+});
+
 test('PBKDF2 SHA256 agrees with Node standard vectors', () => {
   const c = makeClient();
   const vectors = [
@@ -155,7 +234,8 @@ test('login never sends vault passphrase and session stores no plaintext passwor
   const c = makeClient({
     fetchImpl: async (url, opts) => {
       if (url.endsWith('/api/login')) {
-        return { ok: true, json: async () => ({ token: 'tok', email: 'u@e', salt }) };
+        const now = Date.now();
+        return { ok: true, json: async () => ({ token: 'tok', email: 'u@e', salt, issuedAt: now, expiresAt: now + 3600_000 }) };
       }
       if (url.endsWith('/api/sync/snapshot')) {
         return { ok: true, json: async () => ({ items: [], serverTime: 1 }) };
@@ -182,7 +262,7 @@ test('auto-login requires explicit vault unlock on restart', async () => {
   const salt = Buffer.from('legacy-salt').toString('base64');
   const c = makeClient({
     fetchImpl: async (url) => {
-      if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ email: 'u@e', salt, authRevision: 5 }) };
+      if (url.endsWith('/api/me')) { const now = Date.now(); return { ok: true, json: async () => ({ email: 'u@e', salt, authRevision: 5, issuedAt: now - 1000, expiresAt: now + 3600_000 }) }; }
       return { ok: true, json: async () => ({ items: [], serverTime: 1 }) };
     }
   });
@@ -191,6 +271,124 @@ test('auto-login requires explicit vault unlock on restart', async () => {
   assert.equal(ok, true);
   assert.equal(c.run('state.key === null'), true);
   assert.equal(c.run('state.unlockRequired'), true);
+});
+
+test('offline auto-login uses cached encrypted snapshot under active lease and enters read-only', async () => {
+  const now = Date.now();
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/me')) throw new Error('network down');
+      if (url.endsWith('/api/sync/snapshot')) throw new Error('network down');
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+  c.run(`
+    state.key = deriveKey('vault-pass', '${salt}');
+    globalThis.cachedCipher = encValue({ id:'h1', name:'srv', host:'10.0.0.1', user:'root', auth:'password', password:'pw' });
+    state.key = null;
+  `);
+  c.storage.set('tiassh_snapshot_cache', JSON.stringify({
+    v: 1, server: 'https://srv', email: 'u@e', salt,
+    serverTime: 99,
+    cachedAt: now,
+    items: [{ category: 'host', key: 'h1', value: c.run('globalThis.cachedCipher') }]
+  }));
+  c.storage.set('tiassh_session', JSON.stringify({
+    token: 'tok', email: 'u@e', salt, server: 'https://srv', issuedAt: now - 1_000, expiresAt: now + (3 * 60 * 60 * 1000)
+  }));
+
+  const ok = await c.run('tryAutoLogin()');
+  assert.equal(ok, true);
+  await c.run("unlockVault('vault-pass')");
+  assert.equal(c.run('state.readOnly'), true);
+  assert.equal(c.run('state.offlineMode'), true);
+  assert.equal(c.run("state.hosts.get('h1').host"), '10.0.0.1');
+});
+
+test('offline auto-login refuses expired lease and clears session', async () => {
+  const now = Date.now();
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async () => { throw new Error('offline'); }
+  });
+  c.storage.set('tiassh_session', JSON.stringify({
+    token: 'tok', email: 'u@e', salt, server: 'https://srv', issuedAt: now - (40 * 60 * 60 * 1000), expiresAt: now - 1_000
+  }));
+
+  const ok = await c.run('tryAutoLogin()');
+  assert.equal(ok, false);
+  assert.equal(c.storage.get('tiassh_session') || null, null);
+});
+
+test('session stores authoritative lease fields from login and me with expires_at fallback', async () => {
+  const now = Date.now();
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  let loginCalls = 0;
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/login')) {
+        loginCalls++;
+        return { ok: true, json: async () => ({ token: 'tok', email: 'u@e', salt, issuedAt: now, expires_at: now + 3600_000 }) };
+      }
+      if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ email: 'u@e', salt, issuedAt: now, expiresAt: now + 7200_000 }) };
+      if (url.endsWith('/api/sync/snapshot')) return { ok: true, json: async () => ({ items: [], serverTime: 1 }) };
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+
+  c.run("$('authServer').value='https://srv'; $('authEmail').value='u@e'; $('authPass').value='account-pass'; $('authVaultPass').value='vault-pass';");
+  await c.run('doLogin()');
+  const afterLogin = JSON.parse(c.storage.get('tiassh_session'));
+  assert.equal(afterLogin.issuedAt, now);
+  assert.equal(afterLogin.expiresAt, now + 3600_000);
+
+  await c.run('tryAutoLogin()');
+  const afterMe = JSON.parse(c.storage.get('tiassh_session'));
+  assert.equal(afterMe.issuedAt, now);
+  assert.equal(afterMe.expiresAt, now + 7200_000);
+  assert.equal(loginCalls, 1);
+});
+
+test('read-only mode blocks host write actions', async () => {
+  const c = makeClient();
+  c.run("state.readOnly = true; state.hosts.set('h1',{id:'h1',host:'x'});");
+  await c.run("pushItem('h1', {id:'h1',host:'y'})");
+  await c.run("pushItem('h1', null)");
+  assert.equal(c.fetchCalls.filter(x => String(x.url).endsWith('/api/sync/push')).length, 0);
+});
+
+test('online recovery exits read-only mode and pulls latest snapshot delta', async () => {
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/me')) {
+        const now = Date.now();
+        return { ok: true, json: async () => ({ email: 'u@e', salt, issuedAt: now - 1000, expiresAt: now + 100000 }) };
+      }
+      if (url.includes('/api/sync/pull?since=')) {
+        return {
+          ok: true,
+          json: async () => ({
+            items: [{ category: 'host', key: 'h2', value: c.run("encValue({id:'h2',host:'2.2.2.2',user:'root',auth:'password',password:'pw'})") }],
+            serverTime: 42
+          })
+        };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+  c.run(`
+    state.salt = '${salt}'; state.email = 'u@e';
+    state.key = deriveKey('vault-pass', state.salt);
+    state.readOnly = true;
+    state.offlineMode = true;
+    state.lastSync = 0;
+  `);
+  await c.run('recoverOnlineIfPossible()');
+  assert.equal(c.run('state.readOnly'), false);
+  assert.equal(c.run('state.offlineMode'), false);
+  assert.equal(c.run("state.hosts.get('h2').host"), '2.2.2.2');
 });
 
 test('legacy ciphertext decrypts and full legacy snapshot migrates to v2 envelope', async () => {
