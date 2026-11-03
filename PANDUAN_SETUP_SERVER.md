@@ -1,5 +1,196 @@
 # Panduan setup dan migrasi server TiaSSH
 
+## Quick start Ubuntu 22.04 (otomatis, direkomendasikan)
+
+> Jalankan semua command ini di server **Ubuntu 22.04** sebagai user dengan akses `sudo`.
+
+### A) Update OS + kernel dulu
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo apt-get -y autoremove --purge
+sudo reboot
+```
+
+Setelah login lagi:
+
+```bash
+uname -r
+lsb_release -a
+```
+
+### B) Install dependensi dasar
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg unzip tar xz-utils util-linux nginx
+```
+
+### C) Install Node.js 24 + npm
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs build-essential
+node -v
+npm -v
+```
+
+### D) Deploy cepat pakai installer
+
+Contoh asumsi source server Anda ada di `/root/tiassh/server` dan domain publik: `ssh.example.com`.
+
+```bash
+cd /root/tiassh/server
+sudo env APP_DIR=/opt/tiassh PORT=8080 \
+  PUBLIC_URL=https://ssh.example.com \
+  WEB_ORIGIN=https://ssh.example.com \
+  bash install-server.sh
+```
+
+### E) Aktivasi daemon + cek service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable tiassh
+sudo systemctl restart tiassh
+sudo systemctl status tiassh --no-pager
+curl -fsS http://127.0.0.1:8080/api/health
+```
+
+### F) Reverse proxy HTTPS (Nginx)
+
+```bash
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo nano /etc/nginx/sites-available/tiassh
+```
+
+Isi config contoh:
+
+```nginx
+server {
+    listen 80;
+    server_name ssh.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+Aktifkan site + SSL:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tiassh /etc/nginx/sites-enabled/tiassh
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d ssh.example.com
+sudo certbot renew --dry-run
+curl -fsS https://ssh.example.com/api/health
+```
+
+---
+
+## Install manual Ubuntu 22.04 (tanpa installer otomatis)
+
+Pakai mode ini jika Anda ingin menyusun service secara manual step-by-step.
+
+### 1) Update OS + install paket
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo apt-get install -y ca-certificates curl gnupg unzip tar xz-utils util-linux nginx
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs build-essential
+node -v
+npm -v
+```
+
+### 2) Siapkan direktori aplikasi
+
+```bash
+sudo mkdir -p /opt/tiassh/server
+sudo chown -R $USER:$USER /opt/tiassh
+```
+
+### 3) Upload/copy source server
+
+```bash
+rsync -av --delete \
+  --exclude node_modules --exclude data --exclude .git --exclude .env \
+  /root/tiassh/server/ /opt/tiassh/server/
+```
+
+### 4) Install dependency produksi
+
+```bash
+cd /opt/tiassh/server
+npm ci --omit=dev --no-audit --no-fund
+mkdir -p data
+```
+
+### 5) Buat service systemd manual
+
+```bash
+sudo tee /etc/systemd/system/tiassh.service >/dev/null <<'EOF'
+[Unit]
+Description=TiaSSH account and sync server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tiassh/server
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=8080
+Environment=PUBLIC_URL=https://ssh.example.com
+Environment=WEB_ORIGIN=https://ssh.example.com
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+### 6) Enable + jalankan daemon
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable tiassh
+sudo systemctl restart tiassh
+sudo systemctl status tiassh --no-pager
+```
+
+### 7) Cek health + log
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/health
+sudo journalctl -u tiassh -n 100 --no-pager
+```
+
+### 8) Inisialisasi recovery key (wajib, interaktif)
+
+Jika belum pernah diinit, jalankan dari TTY interaktif (tanpa redirect/tee):
+
+```bash
+cd /opt/tiassh/server
+sudo env DATA_DIR=/opt/tiassh/server/data node admin-recovery.js init
+```
+
+Simpan key sekali tampil itu secara offline.
+
+---
+
 ## 1. Persiapan
 
 - Linux dengan systemd (contoh Debian/Ubuntu), akses root/sudo, Node.js **24+**, npm, curl, tar, dan util-linux (`flock`). Installer tidak mengunduh script NodeSource/menjalankannya sebagai root dan tidak mengubah firewall otomatis.
