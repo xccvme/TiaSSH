@@ -1,0 +1,44 @@
+{
+  "name": "tiassh",
+  "productName": "TiaSSH",
+  "version": "1.0.0",
+  "description": "TiaSSH - Free self-hosted SSH client (Termius-like) - desktop",
+  "main": "main.js",
+  "author": "Tia",
+  "license": "WTFPL",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.tiassh.desktop",
+    "productName": "TiaSSH",
+    "files": [
+      "main.js",
+      "web/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Network"
+    }
+  }
+}

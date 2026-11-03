@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TiaSSH Portal Akun</title>
+  <link rel="stylesheet" href="/web/portal.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="card" id="authCard">
+      <h1>Kelola akun</h1>
+      <p>Portal web khusus akun: daftar, login, profil, ganti sandi, dan TOTP.</p>
+      <div class="grid">
+        <div>
+          <label>Email</label><input id="email" autocomplete="username" />
+        </div>
+        <div>
+          <label>Kata sandi</label><input id="password" type="password" autocomplete="current-password" />
+        </div>
+        <div class="full hidden" id="otpWrap">
+          <label>OTP 6 digit</label><input id="otp" inputmode="numeric" maxlength="6" />
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnRegister">Daftar</button>
+        <button id="btnConfirm" class="hidden">Konfirmasi OTP</button>
+        <button id="btnLogin" class="ghost">Login Web</button>
+      </div>
+      <div class="mono hidden" id="enrollBox"></div>
+      <div class="status" id="authStatus"></div>
+    </div>
+
+    <div class="card hidden" id="accountCard">
+      <h1>Akun</h1>
+      <p id="accountEmail" class="muted"></p>
+      <div class="grid">
+        <div class="full">
+          <label>Nama tampilan</label><input id="displayName" maxlength="80" />
+        </div>
+        <div>
+          <label>Sandi saat ini</label><input id="currentPassword" type="password" />
+        </div>
+        <div>
+          <label>OTP fresh</label><input id="freshOtp" maxlength="6" inputmode="numeric" />
+        </div>
+        <div class="full">
+          <label>Sandi baru (opsional)</label><input id="newPassword" type="password" />
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnSaveProfile">Simpan profil</button>
+        <button id="btnChangePassword" class="ghost">Ganti sandi</button>
+        <button id="btnResetTotp" class="ghost">Mulai reset TOTP</button>
+        <button id="btnLogout" class="ghost">Logout</button>
+      </div>
+      <div class="mono hidden" id="totpResetBox"></div>
+      <div class="full hidden" id="confirmResetWrap">
+        <label>OTP secret baru</label><input id="resetOtp" maxlength="6" inputmode="numeric" />
+        <button id="btnConfirmReset" class="ghost">Konfirmasi reset TOTP</button>
+      </div>
+      <div class="status" id="acctStatus"></div>
+    </div>
+  </div>
+  <script src="/web/portal.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,186 @@
+# Panduan setup dan migrasi server TiaSSH
+
+## 1. Persiapan
+
+- Linux dengan systemd (contoh Debian/Ubuntu), akses root/sudo, Node.js **24+**, npm, curl, tar, dan util-linux (`flock`). Installer tidak mengunduh script NodeSource/menjalankannya sebagai root dan tidak mengubah firewall otomatis.
+- Server memakai `node:sqlite` (minimum runtime sumber 22.13; installer meminta 24+).
+- Domain HTTPS yang menunjuk ke VPS, port 80/443 untuk reverse proxy, konektivitas outbound ke port SSH target. Server bukan daemon SSH: native → HTTP/WebSocket TiaSSH → SSH target.
+- Ruang disk untuk salinan sumber, dependensi baru, dan **salinan seluruh data lama**. Backup berisi akun, secret TOTP, sesi, ciphertext, dan `master.key`; lindungi sebagai data rahasia.
+- Satu service dan satu proses yang menulis DB. Jangan menjalankan proses manual bersamaan dengan service; installer hanya menghentikan service yang dikonfigurasi, bukan semua proses Node.
+
+Cek prasyarat:
+
+```bash
+node --version
+npm --version
+command -v curl tar flock
+systemctl --version
+```
+
+Pasang Node 24 melalui package manager/repositori resmi yang telah Anda verifikasi. Jika Node tidak ada atau terlalu lama, installer berhenti sebelum deploy; tidak ada upgrade OS/Node tersembunyi.
+
+## 2. Deploy pertama, interaktif
+
+Upload **folder `server/` lengkap**, termasuk portal, `account-security.js`, `admin-recovery.js`, package-lock, dan installer. Jangan upload data pengguna atau node_modules dari mesin pengembangan.
+
+```bash
+sudo env APP_DIR=/opt/tiassh PORT=8080 \
+  PUBLIC_URL=https://ssh.example.com \
+  WEB_ORIGIN=https://ssh.example.com \
+  bash /root/tiassh/server/install-server.sh
+```
+
+Ganti domain/path contoh dengan milik Anda. Jalankan dari terminal interaktif tanpa `tee`, redirection, CI log, screen recording, atau transcript terminal. Setelah health check, jika recovery key belum ada, installer memanggil `node admin-recovery.js init` dengan stdin/stdout langsung ke operator. **Key acak ditampilkan sekali saja; simpan offline/password manager.** DB hanya menyimpan verifier hash recovery. Jangan kirim key ke developer/chat, jangan commit key, jangan mencoba CLI ini pada data produksi untuk pengujian.
+
+Installer:
+
+1. Validasi root, Node, URL/path/port dan lock deployment.
+2. Snapshot sumber ke staging, mengecualikan `data`, `node_modules`, `.env`, `.git`. Aman walaupun installer dijalankan dari `/opt/tiassh/server` sendiri.
+3. Install dependensi **di staging** (`npm ci --omit=dev` jika package-lock tersedia). Kegagalan ini tidak menyentuh aplikasi lama.
+4. Hentikan service aktif. Jika stop gagal, berhenti tanpa menyalin DB yang masih berjalan.
+5. Salin seluruh direktori data lama **termasuk `tiassh.db-wal`, `tiassh.db-shm`, `master.key`**. Aplikasi lama dipindahkan ke backup transaksi, bukan dihapus.
+6. Aktifkan release baru, tulis systemd unit, daemon-reload, enable, dan **restart eksplisit**; `enable --now` saja tidak cukup untuk update service yang sudah aktif.
+7. Periksa service aktif dan respons `/api/health` (`ok: true`, `name: tiassh-sync`), lalu periksa verifier recovery. Kegagalan melakukan rollback berkas/data/unit dan mencoba restart service lama jika sebelumnya aktif.
+
+Direktori transaksi `/opt/tiassh/.deploy.XXXXXXXX/` dipertahankan untuk backup/diagnosis, dengan permission privat. Setelah sukses `old-app/` adalah snapshot sebelum update. Setelah kegagalan pasca-cutover, `failed-app/` berisi release gagal dan datanya. Review lalu hapus backup lama secara manual sesuai retensi; **jangan menghapus data aktif**. Rollback best-effort tidak menjamin keberhasilan saat disk rusak/penuh, permission salah, listrik padam, atau stop/restart gagal lagi. Periksa pesan error dan service sendiri.
+
+### Deployment noninteraktif
+
+Jika key recovery belum ada, deployment **gagal dengan instruksi init manual**, bukan membuat key lalu mencatatnya ke log. Release gagal tetap disimpan di `TX/failed-app` dan release lama dipulihkan.
+
+Untuk **deploy pertama** yang gagal karena non-TTY, ikuti path transaksi nyata yang dicetak installer, dari terminal pribadi:
+
+```bash
+# Ganti TX dengan path .deploy.* yang dicetak; JANGAN ambil wildcard acak.
+TX=/opt/tiassh/.deploy.GANTI_DENGAN_PATH_ASLI
+cd "$TX/failed-app"
+sudo env DATA_DIR="$TX/failed-app/data" node admin-recovery.js init
+# Simpan key sekali, offline; jangan redirect stdout.
+sudo mkdir -p /opt/tiassh/server
+sudo cp -a "$TX/failed-app/data" /opt/tiassh/server/data
+# Jalankan kembali installer dari source upload dengan URL yang sama.
+```
+
+Untuk **update akun lama** dengan key belum diinisialisasi, cara aman yang disarankan adalah ulangi installer secara interaktif. Jangan menimpa DB aktif dengan `failed-app/data`: salinan tersebut mungkin tertinggal setelah service lama hidup kembali. Init di DB lama hanya jika schema account-security sudah tersedia dan service dihentikan/backup dibuat. CLI `init` bukan bootstrap DB kosong: ia memerlukan tabel dasar yang disiapkan server.
+
+## 3. Konfigurasi
+
+| Variabel installer | Default / arti |
+|---|---|
+| `APP_DIR` | `/opt/tiassh`; aplikasi di `$APP_DIR/server`, data di `$APP_DIR/server/data` |
+| `SYSTEMD_DIR` | `/etc/systemd/system`; override untuk harness/test |
+| `SERVICE_NAME` | `tiassh`; nama systemd unit |
+| `PORT` | `8080`, angka 1–65535 |
+| `PUBLIC_URL` | URL publik; jika kosong menggunakan IP pertama `hostname -I` (atau loopback jika tidak tersedia) + port. Fallback **tidak menjamin IP publik/reachable**; tetapkan domain sendiri. |
+| `WEB_ORIGIN` | Default `PUBLIC_URL`; origin portal `scheme://host[:port]`, tanpa path/query/fragment. Harus sama dengan origin yang dibuka browser. |
+| `HEALTH_RETRIES` | `15`; jumlah pemeriksaan |
+| `HEALTH_DELAY_SEC` | `1`; jeda pemeriksaan |
+
+APP_DIR/path systemd harus absolute, tanpa spasi/karakter kontrol; target/data symlink tidak didukung. Installer tidak membaca `.env` dan selalu mengganti unit miliknya. Jika deployment lama memakai `DATA_DIR` eksternal, **backup dan migrasikan secara sadar sebelum menjalankan installer** atau pertahankan konfigurasi lewat systemd drop-in dan verifikasi path data; installer standar hanya memelihara `$APP_DIR/server/data`. Jangan mengasumsikan data di path lain akan otomatis disalin.
+
+Untuk service manual, variabel tambahan di server meliputi `DATA_DIR`, `NATIVE_ORIGINS`, `SESSION_TTL_SEC`; jangan mengubah allowlist origin tanpa memahami pembatasan browser/native. Lihat sumber untuk nilai persis. Service default berjalan sebagai root karena installer root/systemd; untuk hardening buat akun khusus dan drop-in `User=`, berikan akses data yang benar, lalu uji. Installer tidak mengklaim sandbox service lengkap.
+
+Mengubah konfigurasi unit/drop-in memerlukan:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart tiassh
+```
+
+Pastikan drop-in lama tidak menimpa URL/port baru. Jangan memakai URL loopback VPS di HP.
+
+## 4. HTTPS reverse proxy (Nginx)
+
+1. Arahkan DNS domain ke IP VPS. Buka TCP 80/443 di firewall cloud dan host; jangan membuka port 8080 ke publik jika hanya proxy lokal yang memerlukannya.
+2. Pasang Nginx/Certbot:
+
+```bash
+sudo apt-get update
+sudo apt-get install nginx certbot python3-certbot-nginx
+sudo nano /etc/nginx/sites-available/tiassh
+```
+
+Isi config (ganti domain):
+
+```nginx
+server {
+    listen 80;
+    server_name ssh.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tiassh /etc/nginx/sites-enabled/tiassh
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d ssh.example.com
+sudo certbot renew --dry-run
+curl -fsS https://ssh.example.com/api/health
+```
+
+Jika symlink sudah ada jangan membuatnya ulang. Konfigurasi di atas meneruskan `/ws` melalui blok `/`; tidak boleh membuang header Upgrade. Konfigurasi `PUBLIC_URL` dan `WEB_ORIGIN` harus **HTTPS publik**, walau upstream ke Node HTTP lokal, agar cookie portal Secure dan pemeriksaan origin cocok. Header forwarded bukan bukti identitas klien yang boleh dipercaya sembarang; jangan mengubah trust proxy sembarangan.
+
+HTTP hanya untuk pengembangan/LAN terkendali; sandi, token, dan kredensial proxy dapat disadap melalui HTTP. Jangan menyatakan Android selalu mengizinkan cleartext: gunakan HTTPS dan sertifikat terpercaya. Browser/native harus memakai domain yang sama dengan sertifikat, bukan IP yang tidak tercakup.
+
+## 5. Migrasi tanpa membuang data
+
+**Jangan** menjalankan installer lama yang menghapus folder server sebelum menyalin source, menghapus tabel users, mengubah salt akun, atau membuat akun ulang untuk “memperbaiki” login.
+
+1. Catat service, URL, port, DATA_DIR, drop-in, versi Node, dan passphrase vault pengguna. Hentikan penulisan/proses manual lain.
+2. Backup data konsisten ketika service berhenti:
+
+```bash
+sudo systemctl stop tiassh
+sudo tar -C /opt/tiassh/server -czf /root/tiassh-data-backup.tar.gz data
+sudo systemctl start tiassh
+```
+
+Simpan arsip di penyimpanan terenkripsi/akses terbatas; jangan tar DB hidup tanpa mekanisme SQLite backup. Salin seluruh data dan WAL/SHM, bukan DB saja. Simpan recovery key terpisah, bukan dalam source/zip/log.
+
+3. Upload source baru tanpa data/node_modules. Jalankan installer baru interaktif dengan APP_DIR/URL/port yang sama. Same-source deploy didukung, tetapi upload terpisah memudahkan rollback/source review.
+4. Migrasi schema dilakukan server. Akun, ciphertext, dan salt dipertahankan. Sesi legacy dapat dicabut; login ulang. Akun lama akan diminta enrollment TOTP lewat web.
+5. Native membuka vault menggunakan passphrase lama (default sandi login **asli** ketika vault dibuat). Mengubah sandi web bukan rekey vault. Klien mendukung envelope legacy dan v2; uji data nyata dengan backup sebelum memakai seluruh perangkat. Jangan menjalankan klien versi lama dan baru bersamaan selama migrasi vault.
+6. Periksa data dan login di dua perangkat, SSH/SFTP, serta reconnect sesudah network/background. Health check tidak membuktikan semua ini.
+
+## 6. Recovery administrator
+
+Recovery key hanya untuk operator. CLI menolak stdin/stdout non-TTY.
+
+```bash
+sudo systemctl stop tiassh
+cd /opt/tiassh/server
+sudo env DATA_DIR=/opt/tiassh/server/data node admin-recovery.js reset-email
+sudo systemctl start tiassh
+```
+
+Prompt meminta recovery key, email akun, dan sandi baru (12–72 byte). Reset mempertahankan ciphertext dan salt; semua sesi dicabut dan TOTP dihapus. Pengguna login portal dengan sandi baru untuk enrollment TOTP ulang, lalu native login dengan sandi baru **dan passphrase vault lama**. Tanpa passphrase vault lama, data tetap tidak bisa dibuka. Jangan menghapus user/ciphertext sebagai langkah reset. Key yang hilang tidak dapat ditampilkan kembali oleh CLI; lindungi backup offline sejak init.
+
+## 7. Verifikasi dan troubleshooting
+
+```bash
+sudo systemctl status tiassh
+sudo journalctl -u tiassh -n 50 --no-pager
+curl -fsS http://127.0.0.1:8080/api/health
+curl -fsS https://ssh.example.com/api/health
+```
+
+- Node hilang/lama: pasang Node 24, pastikan executable systemd sama dengan yang diuji.
+- Health gagal: periksa log startup, port bentrok, permission data, dependensi; installer nonzero dan mencoba rollback. Cek old-app/failed-app, jangan hapus backup.
+- Rollback restart gagal: data lama masih backup; hentikan proses lain, pulihkan old-app/unit dengan path transaksi tepat dan restart manual. Jangan lanjut update sebelum penyebab diketahui.
+- Browser ditolak origin/cookie: WEB_ORIGIN harus sama dengan URL browser, PUBLIC_URL HTTPS benar, bukan URL upstream localhost.
+- OTP ditolak: kode sudah dipakai, tunggu 30 detik berikutnya; periksa sinkronisasi waktu/NTP HP/server. Jangan disable TOTP sebagai shortcut.
+- Login berhasil tetapi vault gagal: sandi login baru bukan passphrase lama. Jangan reset salt atau memaksa menulis ciphertext kosong.
+- Android reconnect: cek TLS, jaringan/DNS, proxy Upgrade `/ws`, sesi setelah reset/sandi berubah; uji background/resume nyata. Bukan klaim perbaikan tervalidasi hanya dari health.
+
+Checklist operator sebelum menyatakan siap: HTTPS valid; recovery key tersimpan offline; health lokal/publik aktif; daftar/enrollment web; replay OTP ditolak; perubahan profil/sandi membutuhkan sandi saat ini + kode baru; native login dan passphrase lama; sync dua perangkat; SSH/SFTP; background/reconnect; backup dan restore sandbox. Hasil test otomatis bukan jaminan tidak ada masalah produksi.
