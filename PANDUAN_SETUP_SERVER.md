@@ -2,14 +2,15 @@
 
 ## Quick start Ubuntu 22.04 (otomatis, direkomendasikan)
 
-> Jalankan semua command ini di server **Ubuntu 22.04** sebagai user dengan akses `sudo`.
+> Jalankan di **Ubuntu Server 22.04 LTS**, VM/VPS dengan systemd, sebagai user dengan akses `sudo`. Pilih **satu** jalur: cepat atau manual. Ganti seluruh `ssh.example.com` dengan domain Anda, arahkan DNS A/AAAA ke VPS, dan gunakan port SSH administrasi yang benar. Installer tidak memasang Node atau mengubah firewall otomatis.
 
 ### A) Update OS + kernel dulu
+
+Backup/snapshot VPS dan jadwalkan downtime sebelum upgrade; `reboot` memutus sesi SSH. `full-upgrade` memperbarui kernel mengikuti metapackage yang sudah terpasang. Jangan memakai `do-release-upgrade`: contoh ini tetap Ubuntu 22.04. Untuk VM Ubuntu standar yang **belum memiliki** metapackage kernel, gunakan `sudo apt-get install linux-generic` sebelum reboot. VPS dengan kernel khusus/cloud (`linux-virtual`, `linux-aws`, dll.) harus mengikuti image/provider; container/OpenVZ tidak bisa memperbarui kernel host dari dalam container. Jangan menghapus kernel lama sebelum kernel baru berhasil boot.
 
 ```bash
 sudo apt-get update
 sudo apt-get -y full-upgrade
-sudo apt-get -y autoremove --purge
 sudo reboot
 ```
 
@@ -24,29 +25,37 @@ lsb_release -a
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg unzip tar xz-utils util-linux nginx
+sudo apt-get install -y ca-certificates curl gnupg git rsync nano unzip tar xz-utils util-linux nginx sqlite3
 ```
 
 ### C) Install Node.js 24 + npm
 
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_24.x -o "$HOME/nodesource_setup_24.sh"
+less "$HOME/nodesource_setup_24.sh"
+# Setelah memeriksa dan mempercayai script NodeSource:
+sudo -E bash "$HOME/nodesource_setup_24.sh"
 sudo apt-get install -y nodejs build-essential
 node -v
 npm -v
 ```
 
-### D) Deploy cepat pakai installer
+### D) Download source dan deploy cepat
 
-Contoh asumsi source server Anda ada di `/root/tiassh/server` dan domain publik: `ssh.example.com`.
+NodeSource memasang **npm bersama paket nodejs**; jangan memasang paket `npm` Ubuntu terpisah atau memakai Node lama bawaan Ubuntu. Uji SQLite: `node -e "require('node:sqlite'); console.log('SQLite OK')"`.
+
+Download dari GitHub (perintah di bawah untuk folder baru; jika sudah ada, jangan menimpa data lama):
 
 ```bash
-cd /root/tiassh/server
+git clone https://github.com/xccvme/TiaSSH.git "$HOME/tiassh"
+cd "$HOME/tiassh/server"
 sudo env APP_DIR=/opt/tiassh PORT=8080 \
   PUBLIC_URL=https://ssh.example.com \
   WEB_ORIGIN=https://ssh.example.com \
   bash install-server.sh
 ```
+
+Installer sudah membuat daemon, enable boot dan restart. Recovery key ditampilkan **sekali** di terminal interaktif; simpan offline/password manager. Jangan menjalankan installer dengan `tee`, redirect, CI log, atau rekaman layar. Init yang gagal/non-TTY menyebabkan rollback, bukan key dicetak ke log.
 
 ### E) Aktivasi daemon + cek service
 
@@ -59,6 +68,20 @@ curl -fsS http://127.0.0.1:8080/api/health
 ```
 
 ### F) Reverse proxy HTTPS (Nginx)
+
+Buka TCP 80/443 pada firewall provider/security group. Jika memakai UFW, **izinkan port SSH administrasi sebelum enable** agar tidak terkunci. Contoh ini mengasumsikan SSH port 22; sesuaikan jika bukan 22. Jangan menjalankan UFW di container atau host yang firewall-nya dikelola sistem lain tanpa review.
+
+```bash
+sudo apt-get install -y ufw
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw deny 8080/tcp
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Server Node mendengarkan semua interface; jangan buka 8080 ke publik. Nginx tetap memakai upstream loopback. Periksa aturan UFW lama dan firewall provider, jangan menganggap `deny` membatalkan semua aturan `allow` yang sudah ada.
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
@@ -105,40 +128,77 @@ Pakai mode ini jika Anda ingin menyusun service secara manual step-by-step.
 
 ### 1) Update OS + install paket
 
+Ikuti langkah **A** di atas termasuk reboot dan pemeriksaan kernel, lalu jalankan:
+
 ```bash
 sudo apt-get update
-sudo apt-get -y full-upgrade
-sudo apt-get install -y ca-certificates curl gnupg unzip tar xz-utils util-linux nginx
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y ca-certificates curl gnupg git rsync nano unzip tar xz-utils util-linux nginx sqlite3
+curl -fsSL https://deb.nodesource.com/setup_24.x -o "$HOME/nodesource_setup_24.sh"
+less "$HOME/nodesource_setup_24.sh"
+# Setelah memeriksa dan mempercayai script NodeSource:
+sudo -E bash "$HOME/nodesource_setup_24.sh"
 sudo apt-get install -y nodejs build-essential
 node -v
 npm -v
 ```
 
-### 2) Siapkan direktori aplikasi
+### 2) Download source dan siapkan akun service
+
+Hanya untuk instalasi **baru**; untuk update/migrasi gunakan bagian migrasi/installer transaksional di bawah. Jangan rsync source ke aplikasi produksi yang masih berjalan.
 
 ```bash
-sudo mkdir -p /opt/tiassh/server
-sudo chown -R $USER:$USER /opt/tiassh
+git clone https://github.com/xccvme/TiaSSH.git "$HOME/tiassh"
+sudo useradd --system --user-group --home-dir /opt/tiassh --shell /usr/sbin/nologin tiassh
+sudo install -d -m 0755 /opt/tiassh/server
 ```
+
+Jika akun `tiassh` sudah ada, lewati `useradd`; periksa `id tiassh`. Jangan menjalankan instalasi baru di direktori yang berisi data lama.
 
 ### 3) Upload/copy source server
 
 ```bash
-rsync -av --delete \
+sudo rsync -av \
   --exclude node_modules --exclude data --exclude .git --exclude .env \
-  /root/tiassh/server/ /opt/tiassh/server/
+  "$HOME/tiassh/server/" /opt/tiassh/server/
+sudo chown -R tiassh:tiassh /opt/tiassh/server
 ```
 
 ### 4) Install dependency produksi
 
 ```bash
 cd /opt/tiassh/server
-npm ci --omit=dev --no-audit --no-fund
-mkdir -p data
+sudo -u tiassh npm ci --omit=dev --no-audit --no-fund
+sudo -u tiassh mkdir -p data
+sudo chmod 700 data
 ```
 
-### 5) Buat service systemd manual
+### 5) Uji Node foreground + inisialisasi recovery
+
+Jalankan server pertama kali untuk membuat schema SQLite. Buka sesi SSH kedua untuk health check, lalu hentikan proses foreground dengan **Ctrl+C** sebelum membuat daemon. Jangan menjalankan dua penulis DB bersamaan.
+
+```bash
+cd /opt/tiassh/server
+sudo -u tiassh env NODE_ENV=production PORT=8080 \
+  PUBLIC_URL=https://ssh.example.com WEB_ORIGIN=https://ssh.example.com \
+  DATA_DIR=/opt/tiassh/server/data /usr/bin/node server.js
+```
+
+Di sesi SSH kedua:
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/health
+```
+
+Setelah Ctrl+C, jalankan init di terminal pribadi (tanpa redirect/tee):
+
+```bash
+cd /opt/tiassh/server
+sudo -u tiassh env DATA_DIR=/opt/tiassh/server/data /usr/bin/node admin-recovery.js init
+```
+
+Simpan recovery key offline; key tidak bisa ditampilkan ulang. DB hanya menyimpan verifier hash.
+
+### 6) Buat service systemd manual
 
 ```bash
 sudo tee /etc/systemd/system/tiassh.service >/dev/null <<'EOF'
@@ -148,12 +208,15 @@ After=network.target
 
 [Service]
 Type=simple
+User=tiassh
+Group=tiassh
 WorkingDirectory=/opt/tiassh/server
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=3
 Environment=NODE_ENV=production
 Environment=PORT=8080
+Environment=DATA_DIR=/opt/tiassh/server/data
 Environment=PUBLIC_URL=https://ssh.example.com
 Environment=WEB_ORIGIN=https://ssh.example.com
 
@@ -162,7 +225,7 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### 6) Enable + jalankan daemon
+### 7) Enable + jalankan daemon
 
 ```bash
 sudo systemctl daemon-reload
@@ -171,23 +234,16 @@ sudo systemctl restart tiassh
 sudo systemctl status tiassh --no-pager
 ```
 
-### 7) Cek health + log
+### 8) Cek health + log
 
 ```bash
 curl -fsS http://127.0.0.1:8080/api/health
 sudo journalctl -u tiassh -n 100 --no-pager
 ```
 
-### 8) Inisialisasi recovery key (wajib, interaktif)
+### 9) Aktifkan HTTPS dan firewall
 
-Jika belum pernah diinit, jalankan dari TTY interaktif (tanpa redirect/tee):
-
-```bash
-cd /opt/tiassh/server
-sudo env DATA_DIR=/opt/tiassh/server/data node admin-recovery.js init
-```
-
-Simpan key sekali tampil itu secara offline.
+Ikuti langkah **F** di atas (Nginx + Certbot), lalu lakukan checklist akun/native di bagian verifikasi. Service manual menggunakan akun `tiassh`; untuk CLI recovery dan backup, jalankan sebagai user service yang benar. Jika nanti beralih ke installer otomatis, review unit/drop-in dan ownership karena unit installer standar berjalan sebagai root.
 
 ---
 
