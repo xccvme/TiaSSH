@@ -769,6 +769,70 @@ function hostModal(existing){
 }
 function closeModal(){ $('modalBg').classList.add('hidden'); }
 
+// ---------- TERMINAL CONTEXT MENU ----------
+function showTerminalContextMenu(x, y, rec, selectedText) {
+  // Remove existing menu
+  const existing = document.querySelector('.term-context-menu');
+  if (existing) existing.remove();
+  
+  const menu = document.createElement('div');
+  menu.className = 'term-context-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  
+  const items = [];
+  
+  if (selectedText) {
+    items.push({ label: '📋 Copy', action: () => {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(selectedText).then(() => {
+          toast('Copied to clipboard', 'ok');
+        }).catch(() => {});
+      }
+    }});
+  }
+  
+  items.push({ label: '📄 Paste', action: () => {
+    if (navigator.clipboard) {
+      navigator.clipboard.readText().then(text => {
+        if (text && rec.term) {
+          rec.term.paste(text);
+        }
+      }).catch(() => {});
+    }
+  }});
+  
+  items.push({ label: '🔄 Clear', action: () => {
+    if (rec.term) rec.term.clear();
+  }});
+  
+  items.forEach(item => {
+    const btn = document.createElement('div');
+    btn.className = 'menu-item';
+    btn.textContent = item.label;
+    btn.onclick = () => {
+      item.action();
+      menu.remove();
+    };
+    menu.appendChild(btn);
+  });
+  
+  document.body.appendChild(menu);
+  
+  // Close on click outside
+  setTimeout(() => {
+    const closeMenu = (e) => {
+      if (!menu.contains(e.target)) {
+        menu.remove();
+        document.removeEventListener('click', closeMenu);
+        document.removeEventListener('touchstart', closeMenu);
+      }
+    };
+    document.addEventListener('click', closeMenu);
+    document.addEventListener('touchstart', closeMenu);
+  }, 100);
+}
+
 // ---------- TABS ----------
 function openTab(host){
   if (isMobile()) toggleSidebar(false);
@@ -806,25 +870,53 @@ function openTab(host){
   rec.viewSwitch = vs;
   vs.querySelectorAll('button').forEach(b => b.onclick = () => setView(rec, b.dataset.v));
   
-  // Clipboard support (copy/paste)
+  // Clipboard support - modern approach with context menu
+  let lastSelection = '';
+  
+  // Keyboard shortcuts
   term.attachCustomKeyEventHandler(ev => {
     if (ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
-      document.execCommand('copy');
+      const sel = term.getSelection();
+      if (sel && navigator.clipboard) {
+        navigator.clipboard.writeText(sel).catch(() => {});
+      }
       return false;
     }
     if (ev.ctrlKey && ev.key === 'v') {
-      navigator.clipboard.readText().then(text => term.paste(text)).catch(() => {});
+      if (navigator.clipboard) {
+        navigator.clipboard.readText().then(text => {
+          if (text) term.paste(text);
+        }).catch(() => {});
+      }
       return false;
     }
     return true;
   });
   
-  // Selection → clipboard
+  // Track selection (don't auto-copy on every change to avoid paste duplication)
   term.onSelectionChange(() => {
-    const sel = term.getSelection();
-    if (sel && navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(sel).catch(() => {});
+    lastSelection = term.getSelection();
+  });
+  
+  // Right-click & long-press context menu
+  let pressTimer = null;
+  termDiv.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    showTerminalContextMenu(e.clientX, e.clientY, rec, lastSelection);
+  });
+  termDiv.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) {
+      pressTimer = setTimeout(() => {
+        const touch = e.touches[0];
+        showTerminalContextMenu(touch.clientX, touch.clientY, rec, lastSelection);
+      }, 500);
     }
+  });
+  termDiv.addEventListener('touchend', () => {
+    if (pressTimer) clearTimeout(pressTimer);
+  });
+  termDiv.addEventListener('touchmove', () => {
+    if (pressTimer) clearTimeout(pressTimer);
   });
 
   activateTab(host.id);

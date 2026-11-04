@@ -140,6 +140,13 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
 .toast.err{border-left-color:var(--red)}
 @keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
+/* ===== TERMINAL CONTEXT MENU ===== */
+.term-context-menu{position:fixed;min-width:160px;background:var(--panel);border:1px solid var(--border2);border-radius:10px;box-shadow:0 8px 30px #00000099;z-index:100;overflow:hidden;animation:tin .15s ease-out}
+.term-context-menu .menu-item{padding:10px 14px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--border);user-select:none;display:flex;align-items:center;gap:8px}
+.term-context-menu .menu-item:last-child{border-bottom:none}
+.term-context-menu .menu-item:hover{background:var(--panel3)}
+.term-context-menu .menu-item:active{background:var(--panel2)}
+
 @media(max-width:768px){
   #sidebar{position:absolute;z-index:30;height:100%;transform:translateX(-100%);transition:transform .2s;box-shadow:0 0 40px #000000aa}
   #sidebar.open{transform:none}

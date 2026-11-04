@@ -1,7 +1,7 @@
 "use strict";
 /* ============================================================
    TiaSSH 2.0 — client logic
-   - Zero-knowledge sync: items encrypted client-side (AES-256-GCM)
+   - Zero-knowledge sync: items encrypted client-side (AES-256-CBC + HMAC-SHA256, key = PBKDF2(password, salt, 100000))
      with key derived from user password via PBKDF2(server salt).
      Server stores only ciphertext.
    - SSH + SFTP proxy over WebSocket
@@ -22,10 +22,17 @@ function wsBase(){
 
 // ---------- state ----------
 const state = {
-  token: null, email: null, salt: null, key: null,   // crypto key (CryptoKey)
+  token: null, email: null, salt: null,
+  key: null, legacyKey: null,
+  unlockRequired: false, issuedAt: null, expiresAt: null, leaseSeenAt: null,
+  readOnly: false, offlineMode: false, encryptedItems: new Map(),
   hosts: new Map(), lastSync: 0, ws: null, tabs: new Map(),
-  activeTab: 'welcome'
+  activeTab: 'welcome', nativeTransportActive: false, wsStopped: false
 };
+
+const nativeTransport = window.tiasshNativeTransport;
+const hasNativeTransport = !!(nativeTransport && nativeTransport.available && typeof nativeTransport.send === 'function');
+if (hasNativeTransport) nativeTransport.onEvent(m => onWsMessage({ data: JSON.stringify(m) }));
 
 // ---------- crypto (zero-knowledge, pure JS — works over http, byte-identical across devices) ----------
 // Scheme: PBKDF2-SHA256(password, serverSalt, 100000) -> 64 bytes = encKey(32) | macKey(32)
@@ -37,8 +44,8 @@ function _pbkdf2(password, salt, iterations, keyLen){
   const blocks = Math.ceil(keyLen / 32);
   for (let b = 1; b <= blocks; b++){
     const idx = [(b>>24)&255, (b>>16)&255, (b>>8)&255, b&255];
-    let U = _hmacArr(S, P.concat(idx)), T = U.slice();
-    for (let i = 1; i < iterations; i++){ U = _hmacArr(S, U); for (let j = 0; j < 32; j++) T[j] ^= U[j]; }
+    let U = _hmacArr(P, S.concat(idx)), T = U.slice();
+    for (let i = 1; i < iterations; i++){ U = _hmacArr(P, U); for (let j = 0; j < 32; j++) T[j] ^= U[j]; }
     out.push.apply(out, T);
   }
   return out.slice(0, keyLen);
@@ -58,48 +65,252 @@ function b64toBytes(b64){
   for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
   return out;
 }
+function decodeB64Chunks(chunks){
+  const out = [];
+  for (const chunk of chunks || []) {
+    const b = atob(String(chunk || '').replace(/-/g,'+').replace(/_/g,'/'));
+    for (let i = 0; i < b.length; i++) out.push(b.charCodeAt(i));
+  }
+  return out;
+}
 function bytesToB64(arr){
   const u = arr instanceof Uint8Array ? arr : new Uint8Array(arr);
   let s = '';
   for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
   return btoa(s);
 }
-// state.key = { encKey, macKey }
-function encValue(obj){
-  const pt = _pkcs7pad(_utf8Bytes(JSON.stringify(obj)));
-  const iv = new Array(16);
-  for (let i = 0; i < 16; i++) iv[i] = Math.floor(Math.random() * 256);
-  const c = Array.from(new aesjs.ModeOfOperation.cbc(state.key.encKey, iv).encrypt(pt));
-  const mac = _hmacArr(state.key.macKey, iv.concat(c));
-  return bytesToB64(iv.concat(c, mac));
+function deriveLegacyKey(password, saltB64){
+  const salt = b64toBytes(saltB64);
+  const P = _utf8Bytes(password), S = salt, out = [];
+  const blocks = Math.ceil(64 / 32);
+  for (let b = 1; b <= blocks; b++){
+    const idx = [(b>>24)&255, (b>>16)&255, (b>>8)&255, b&255];
+    let U = _hmacArr(S, P.concat(idx)), T = U.slice();
+    for (let i = 1; i < 100000; i++){ U = _hmacArr(S, U); for (let j = 0; j < 32; j++) T[j] ^= U[j]; }
+    out.push.apply(out, T);
+  }
+  return { encKey: out.slice(0, 32), macKey: out.slice(32, 64) };
 }
-function decValue(b64){
+function _timingSafeEq(a, b){
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= (a[i] ^ b[i]);
+  return diff === 0;
+}
+function _randomIv16(){
+  const u = new Uint8Array(16);
+  crypto.getRandomValues(u);
+  return Array.from(u);
+}
+function _encAesCbc(payload, key){
+  const pt = _pkcs7pad(_utf8Bytes(JSON.stringify(payload)));
+  const iv = _randomIv16();
+  const c = Array.from(new aesjs.ModeOfOperation.cbc(key.encKey, iv).encrypt(pt));
+  const header = _utf8Bytes('v2');
+  const mac = _hmacArr(key.macKey, header.concat(iv, c));
+  return { v: 2, iv: bytesToB64(iv), ct: bytesToB64(c), mac: bytesToB64(mac) };
+}
+function _decodeMaybeJsonEnvelope(raw){
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  const tryParse = s => {
+    try { return JSON.parse(s); } catch(e){ return null; }
+  };
+  const direct = text.startsWith('{') ? tryParse(text) : null;
+  if (direct && Number(direct.v) >= 2) return direct;
+  if (!/^[A-Za-z0-9+/_=-]+$/.test(text)) return null;
+  try {
+    const bytes = b64toBytes(text);
+    const parsed = tryParse(new TextDecoder().decode(new Uint8Array(bytes)));
+    if (parsed && Number(parsed.v) >= 2) return parsed;
+  } catch(e) {}
+  return null;
+}
+function _encodeEnvelopeForStorage(env){
+  return bytesToB64(_utf8Bytes(JSON.stringify(env)));
+}
+function _decAesCbc(env, key){
+  if (!env || env.v !== 2 || typeof env.iv !== 'string' || typeof env.ct !== 'string' || typeof env.mac !== 'string') throw new Error('bad envelope');
+  const iv = b64toBytes(env.iv), c = b64toBytes(env.ct), mac = b64toBytes(env.mac);
+  const header = _utf8Bytes('v2');
+  const expect = _hmacArr(key.macKey, header.concat(iv, c));
+  if (!_timingSafeEq(expect, mac)) throw new Error('decryption failed (wrong passphrase or corrupted data)');
+  const p = Array.from(new aesjs.ModeOfOperation.cbc(key.encKey, iv).decrypt(c));
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(_pkcs7unpad(p))));
+}
+function decLegacyValue(b64){
+  if (!state.legacyKey) throw new Error('vault locked');
   const all = b64toBytes(b64);
   const iv = all.slice(0, 16);
   const c = all.slice(16, all.length - 32);
   const mac = all.slice(all.length - 32);
-  const expect = _hmacArr(state.key.macKey, iv.concat(c));
-  if (JSON.stringify(expect) !== JSON.stringify(mac)) throw new Error('decryption failed (wrong password or corrupted data)');
-  const p = Array.from(new aesjs.ModeOfOperation.cbc(state.key.encKey, iv).decrypt(c));
+  const expect = _hmacArr(state.legacyKey.macKey, iv.concat(c));
+  if (!_timingSafeEq(expect, mac)) throw new Error('legacy auth failed');
+  const p = Array.from(new aesjs.ModeOfOperation.cbc(state.legacyKey.encKey, iv).decrypt(c));
   return JSON.parse(new TextDecoder().decode(new Uint8Array(_pkcs7unpad(p))));
+}
+function encLegacyValue(obj){
+  if (!state.legacyKey) throw new Error('vault locked');
+  const pt = _pkcs7pad(_utf8Bytes(JSON.stringify(obj)));
+  const iv = _randomIv16();
+  const c = Array.from(new aesjs.ModeOfOperation.cbc(state.legacyKey.encKey, iv).encrypt(pt));
+  const mac = _hmacArr(state.legacyKey.macKey, iv.concat(c));
+  return bytesToB64(iv.concat(c, mac));
+}
+// state.key = { encKey, macKey }
+function encValue(obj){
+  if (!state.key) throw new Error('vault locked');
+  return _encodeEnvelopeForStorage(_encAesCbc(obj, state.key));
+}
+function decValue(raw){
+  if (!state.key) throw new Error('vault locked');
+  const env = _decodeMaybeJsonEnvelope(raw);
+  if (env) return _decAesCbc(env, state.key);
+  return decLegacyValue(String(raw || '').trim());
+}
+
+// ---------- local lease and ciphertext cache ----------
+const LOCAL_LEASE_MS = 36 * 60 * 60 * 1000;
+function leaseFields(s){
+  const issuedAt = s && (s.issuedAt !== undefined ? s.issuedAt : s.issued_at);
+  const expiresAt = s && (s.expiresAt !== undefined ? s.expiresAt : s.expires_at);
+  return { issuedAt, expiresAt };
+}
+function leaseValid(s = state, now = Date.now()){
+  const { issuedAt, expiresAt } = leaseFields(s);
+  return Number.isSafeInteger(issuedAt) && Number.isSafeInteger(expiresAt) &&
+    issuedAt > 0 && expiresAt > issuedAt && now >= issuedAt &&
+    (!s.leaseSeenAt || now >= s.leaseSeenAt) &&
+    now < Math.min(expiresAt, issuedAt + LOCAL_LEASE_MS);
+}
+function applyLease(s){
+  const next = leaseFields(s);
+  if (!Number.isSafeInteger(next.issuedAt) || !Number.isSafeInteger(next.expiresAt)) throw new Error('invalid session lease');
+  Object.assign(state, next);
+  state.leaseSeenAt = Date.now();
+}
+function cacheScope(){ return { server: apiBase(), email: state.email, salt: state.salt }; }
+function saveSnapshotCache(items, serverTime){
+  try {
+    localStorage.setItem('tiassh_snapshot_cache', JSON.stringify({
+      v: 1, ...cacheScope(), items: items.map(it => ({ category: it.category, key: it.key, value: it.value, rev: it.rev })),
+      serverTime, cachedAt: Date.now()
+    }));
+    return true;
+  } catch(e) { return false; } // Quota/disabled storage must not break online sync.
+}
+function loadSnapshotCache(){
+  try {
+    const c = JSON.parse(localStorage.getItem('tiassh_snapshot_cache') || 'null');
+    const scope = cacheScope();
+    if (!c || c.v !== 1 || c.server !== scope.server || c.email !== scope.email || c.salt !== scope.salt ||
+        !Array.isArray(c.items) || !Number.isFinite(c.serverTime) ||
+        c.items.some(it => !it || it.category !== 'host' || typeof it.key !== 'string' || typeof it.value !== 'string')) return null;
+    return c;
+  } catch(e) { return null; }
+}
+function setOfflineMode(on){
+  state.offlineMode = on; state.readOnly = on;
+  $('addHostBtn').disabled = on;
+  $('offlineBanner').classList.toggle('hidden', !on);
+  $('offlineBanner').textContent = 'Offline · cache terenkripsi · hanya baca. Login online wajib setelah lease berakhir.';
+  if (on) {
+    closeModal(); setSync(false);
+    clearTimeout(state.wsRetryTimer);
+    if (state.ws) { const ws = state.ws; state.ws = null; ws.close(); }
+    scheduleRecovery();
+  }
+}
+function scheduleLeaseExpiry(){
+  clearTimeout(state.leaseTimer);
+  if (!leaseValid()) return;
+  const ms = Math.min(state.expiresAt, state.issuedAt + LOCAL_LEASE_MS) - Date.now();
+  if (ms <= 0) { logoutSession('Lease berakhir. Login online diperlukan.'); return; }
+  state.leaseTimer = setTimeout(() => logoutSession('Lease berakhir. Login online diperlukan.'), ms);
+}
+function enforceLeaseValidity(now = Date.now()){
+  if (!state.token) return true;
+  if (!leaseValid(state, now)) {
+    logoutSession('Lease berakhir. Login online diperlukan.');
+    return false;
+  }
+  state.leaseSeenAt = now;
+  saveSession();
+  scheduleLeaseExpiry();
+  return true;
+}
+function logoutSession(message){
+  state.wsStopped = true;
+  if (hasNativeTransport) nativeTransport.closeAll().catch(() => {});
+  clearTimeout(state.wsRetryTimer); clearTimeout(state.recoveryTimer); clearTimeout(state.leaseTimer);
+  if (state.ws) { const ws = state.ws; state.ws = null; ws.close(); }
+  state.token = null; state.key = null; state.legacyKey = null; state.unlockRequired = false;
+  state.hosts.clear(); state.encryptedItems.clear(); state.tabs.forEach(r => { if (r.term) r.term.dispose && r.term.dispose(); }); state.tabs.clear();
+  state.issuedAt = null; state.expiresAt = null;
+  state.readOnly = false; state.offlineMode = false;
+  clearSession();
+  $('app').classList.add('hidden'); $('auth').classList.remove('hidden');
+  $('authLoginFields').classList.remove('hidden'); $('authLoginBtn').textContent = 'Login';
+  $('authPass').value = ''; $('authVaultPass').value = ''; $('authErr').textContent = message || '';
+  $('hostList').innerHTML = ''; $('modal').innerHTML = '';
+}
+function scheduleRecovery(){
+  clearTimeout(state.recoveryTimer);
+  state.recoveryTimer = setTimeout(() => recoverOnlineIfPossible(), 10000);
+}
+async function recoverOnlineIfPossible(){
+  if (!state.offlineMode || state.recovering) return false;
+  if (state.token && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+  const tokenAtStart = state.token;
+  state.recovering = true;
+  try {
+    const me = await api('/api/me');
+    if (me.salt !== state.salt || me.email !== state.email) throw new Error('session identity changed');
+    applyLease(me);
+    if (!leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+    saveSession(); scheduleLeaseExpiry();
+    if (state.key) await pullSnapshot(true, tokenAtStart);
+    if (state.token !== tokenAtStart || !state.token) return false;
+    state.offlineMode = false; state.readOnly = false;
+    $('addHostBtn').disabled = false;
+    $('offlineBanner').classList.add('hidden');
+    if (state.key) { state.wsStopped = false; openWs(); }
+    return true;
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
+    else if (state.token) { setOfflineMode(true); }
+    return false;
+  } finally { state.recovering = false; }
+}
+if (window && typeof window.addEventListener === 'function') {
+  window.addEventListener('online', () => recoverOnlineIfPossible());
+  window.addEventListener('focus', () => enforceLeaseValidity());
+}
+if (document && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') enforceLeaseValidity();
+  });
 }
 
 // ---------- session persistence ----------
 function saveSession(){
   localStorage.setItem('tiassh_session', JSON.stringify({
     token: state.token, email: state.email, salt: state.salt,
-    server: localStorage.getItem('tiassh_server') || '',
-    pass: $('authPass') ? $('authPass').value : (state._pass || '')
+    issuedAt: state.issuedAt, expiresAt: state.expiresAt, leaseSeenAt: state.leaseSeenAt,
+    server: localStorage.getItem('tiassh_server') || ''
   }));
 }
 function loadSession(){
   try {
     const s = JSON.parse(localStorage.getItem('tiassh_session') || 'null');
-    if (s && s.token) return s;
+    if (s && s.token) return { ...s, ...leaseFields(s) };
   } catch(e){}
   return null;
 }
-function clearSession(){ localStorage.removeItem('tiassh_session'); }
+function clearSession(){
+  localStorage.removeItem('tiassh_session');
+  localStorage.removeItem('tiassh_snapshot_cache');
+}
 
 // ---------- toast ----------
 function toast(msg, kind){
@@ -112,48 +323,136 @@ function toast(msg, kind){
 
 // ---------- api ----------
 async function api(path, opts={}){
-  const res = await fetch(apiBase()+path, { ...opts, headers: { 'Content-Type':'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}), ...(opts.headers || {}) } });
+  let res;
+  try { res = await fetch(apiBase()+path, { ...opts, headers: { 'Content-Type':'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}), ...(opts.headers || {}) } }); }
+  catch(e) { e.network = true; throw e; }
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(j.error || ('HTTP ' + res.status));
+  if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; throw e; }
   return j;
 }
 
 // ---------- AUTH ----------
-$('authLoginBtn').onclick = () => doLogin('login');
-$('authRegBtn').onclick = () => doLogin('register');
-$('authPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin('login'); });
+$('authLoginBtn').onclick = () => doLogin();
+if ($('authRegBtn')) $('authRegBtn').onclick = () => doLogin();
+$('authPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('authVaultPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
-async function doLogin(mode){
+async function doLogin(){
   $('authErr').textContent = '';
   try {
+    if (state.unlockRequired && state.token) {
+      const vaultPass = $('authVaultPass').value;
+      if (!vaultPass) throw new Error('Masukkan passphrase vault (password akun asli untuk vault lama).');
+      await unlockVault(vaultPass);
+      return;
+    }
     const srv = $('authServer').value.trim().replace(/\/+$/,'');
     localStorage.setItem('tiassh_server', srv);
     const email = $('authEmail').value.trim(), pass = $('authPass').value;
     if (!email || !pass) throw new Error('isi email & password');
-    const j = await api('/api/' + mode, { method: 'POST', body: JSON.stringify({ email, password: pass }) });
-    state.token = j.token; state.email = j.email; state.salt = j.salt; state._pass = pass;
-    state.key = await deriveKey(pass, j.salt);
+    // Portal web bisa ditutup operator; tampilkan di catatan kalau sudah ditutup.
+    try {
+      const cfgRes = await fetch(apiBase() + '/api/config');
+      const cfg = await cfgRes.json();
+      if (cfg && cfg.portalEnabled === false && $('authSignupNote')) {
+        $('authSignupNote').innerHTML = 'Pendaftaran/portal web sedang <b>ditutup</b> oleh operator. Hubungi admin untuk pembuatan akun.';
+      }
+    } catch(e) {}
+    // Vault passphrase stays on this device; only account credentials go to login.
+    const vaultPass = $('authVaultPass').value || pass;
+    const j = await api('/api/login', { method: 'POST', body: JSON.stringify({ email, password: pass }) });
+    state.token = j.token; state.email = j.email; state.salt = j.salt;
+    state.wsStopped = false; applyLease(j); setOfflineMode(false); scheduleLeaseExpiry();
+    $('authPass').value = '';
     saveSession();
-    enterApp();
+    showUnlock();
+    await unlockVault(vaultPass);
   } catch(e) { $('authErr').textContent = e.message; }
+}
+
+function showUnlock(){
+  state.key = null; state.legacyKey = null; state.unlockRequired = true;
+  $('auth').classList.remove('hidden');
+  $('app').classList.add('hidden');
+  $('authPass').value = ''; $('authVaultPass').value = '';
+  $('authLoginFields').classList.add('hidden');
+  $('authLoginBtn').textContent = 'Buka Vault';
+  $('authVaultPass').placeholder = 'Passphrase vault / password akun asli';
+}
+
+async function unlockVault(passphrase){
+  try {
+    state.key = deriveKey(passphrase, state.salt);
+    state.legacyKey = deriveLegacyKey(passphrase, state.salt);
+    if (state.offlineMode && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); throw new Error('Lease berakhir'); }
+    if (state.offlineMode) {
+      const cached = loadSnapshotCache();
+      if (!cached) throw new Error('Cache tidak tersedia. Login online diperlukan.');
+      await applySnapshot(cached, false);
+    } else {
+      try { await pullSnapshot(); } catch(e) {
+        const cached = loadSnapshotCache();
+        if (!e.network || !leaseValid() || !cached) throw e;
+        setOfflineMode(true); await applySnapshot(cached, false);
+      }
+    }
+    state.unlockRequired = false;
+    $('authVaultPass').value = '';
+    enterApp();
+  } catch(e) {
+    state.key = null; state.legacyKey = null; state.unlockRequired = !!state.token;
+    throw e;
+  }
 }
 
 async function tryAutoLogin(){
   const s = loadSession();
   if (!s) return false;
+  const configuredServer = (localStorage.getItem('tiassh_server') || '').replace(/\/+$/,'');
+  const sessionServer = String(s.server || '').replace(/\/+$/,'');
+  if (configuredServer && sessionServer && configuredServer !== sessionServer) {
+    logoutSession('Endpoint berubah. Login online diperlukan.');
+    return false;
+  }
+  // Sanitize sessions saved by older clients before making any request.
+  localStorage.setItem('tiassh_server', s.server || '');
+  state.token = s.token; state.email = s.email; state.salt = s.salt;
+  Object.assign(state, leaseFields(s));
+  state.leaseSeenAt = s.leaseSeenAt || null;
+  if (state.issuedAt && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+  saveSession();
   try {
-    localStorage.setItem('tiassh_server', s.server || '');
-    state.token = s.token; state.email = s.email; state.salt = s.salt; state._pass = s.pass;
-    // verify token still valid + fetch fresh salt
     const me = await api('/api/me');
     state.email = me.email; state.salt = me.salt;
-    state.key = await deriveKey(s.pass, me.salt);
-    enterApp();
+    applyLease(me); setOfflineMode(false); scheduleLeaseExpiry();
+    saveSession();
+    showUnlock();
     return true;
-  } catch(e) { clearSession(); return false; }
+  } catch(e) {
+    if (e.network && leaseValid() && loadSnapshotCache()) {
+      setOfflineMode(true); scheduleLeaseExpiry(); showUnlock(); return true;
+    }
+    logoutSession('Login online diperlukan.'); return false;
+  }
 }
 
-$('logoutBtn').onclick = () => { clearSession(); location.reload(); };
+$('logoutBtn').onclick = () => confirmLogout();
+
+// Logout manual harus lewat konfirmasi supaya tidak terklik tidak sengaja.
+// Auto-logout (lease habis / sesi ditolak) tetap langsung tanpa dialog.
+function confirmLogout(){
+  const m = $('modal');
+  m.innerHTML = `
+    <h2>Keluar dari TiaSSH?</h2>
+    <div class="m-sub">Vault akan terkunci dan sesi perangkat ini berakhir. Host & kunci tetap tersimpan terenkripsi di server.</div>
+    <div class="actions">
+      <button class="btn ghost" id="cxCancel">Batal</button>
+      <button class="btn danger" id="cxOk">Ya, Keluar</button>
+    </div>`;
+  $('modalBg').classList.remove('hidden');
+  $('cxCancel').onclick = closeModal;
+  $('cxOk').onclick = () => { closeModal(); logoutSession(); location.reload(); };
+}
 
 // ---------- APP ----------
 function enterApp(){
@@ -161,18 +460,43 @@ function enterApp(){
   $('app').classList.remove('hidden');
   $('userLine').textContent = state.email;
   $('avatarEl').textContent = (state.email[0] || '?').toUpperCase();
-  api('/api/device', { method: 'POST', body: JSON.stringify({ name: /Mobi|Android/i.test(navigator.userAgent) ? 'android' : 'desktop' }) }).catch(() => {});
-  openWs();
-  pullSnapshot().catch(e => toast('gagal ambil data: ' + e.message, 'err'));
+  if (!state.offlineMode) {
+    api('/api/device', { method: 'POST', body: JSON.stringify({ name: /Mobi|Android/i.test(navigator.userAgent) ? 'android' : 'desktop' }) }).catch(() => {});
+    openWs();
+  }
   window.addEventListener('resize', resizeAll);
 }
 
 // ---------- SYNC (zero-knowledge) ----------
 function openWs(){
-  const ws = new WebSocket(`${wsBase()}/ws?token=${state.token}`);
+  if (!state.token || state.wsStopped || state.offlineMode) return;
+  if (hasNativeTransport && !leaseValid()) return;
+  if (hasNativeTransport) {
+    state.wsRetries = 0;
+    state.nativeTransportActive = true;
+    setSync(true);
+    state.tabs.forEach(rec => { connectSsh(rec); if (rec.view === 'sftp') ensureSftp(rec); });
+    return;
+  }
+  if (state.ws && state.ws.readyState < 2) return;
+  const ws = new WebSocket(`${wsBase()}/ws?token=${encodeURIComponent(state.token)}`);
   ws.onmessage = onWsMessage;
-  ws.onclose = () => { setSync(false); setTimeout(openWs, 3000); };
-  ws.onopen = () => setSync(true);
+  ws.onclose = ev => {
+    if (state.ws !== ws || state.wsStopped) return;
+    setSync(false);
+    if (state.key && leaseValid()) { setOfflineMode(true); return; }
+    const delay = Math.min(30000, 1000 * Math.pow(2, state.wsRetries || 0));
+    state.wsRetries = (state.wsRetries || 0) + 1;
+    $('syncText').textContent = `reconnect ${delay / 1000}s · ${ev && ev.code || 'network'} · periksa endpoint /ws, jaringan, TLS`;
+    clearTimeout(state.wsRetryTimer);
+    state.wsRetryTimer = setTimeout(() => { state.ws = null; openWs(); }, delay);
+  };
+  ws.onopen = () => {
+    if (state.ws !== ws || state.wsStopped) return;
+    state.wsRetries = 0;
+    setSync(true);
+    state.tabs.forEach(rec => { connectSsh(rec); if (rec.view === 'sftp') ensureSftp(rec); });
+  };
   state.ws = ws;
 }
 function setSync(on){
@@ -180,44 +504,99 @@ function setSync(on){
   $('syncText').textContent = on ? 'sync aktif' : 'reconnect…';
   $('userStatus').textContent = on ? 'terhubung · terenkripsi' : 'tersinkron terakhir tersimpan';
 }
-function wsSend(obj){ if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj)); }
+function wsSend(obj){
+  const isRemote = /^(ssh|sftp)-/.test(obj.type);
+  if (isRemote && (!state.token || state.wsStopped || (hasNativeTransport && !leaseValid()))) return;
+  if (!hasNativeTransport && isRemote && state.offlineMode) return;
+  if (hasNativeTransport && isRemote && state.nativeTransportActive) {
+    nativeTransport.send(obj).catch(e => {
+      console.error('Native transport error:', e);
+      // Fallback ke WebSocket proxy saat native transport gagal
+      state.nativeTransportActive = false;
+      toast('Native transport gagal, fallback ke WebSocket proxy…', 'warn');
+      setTimeout(() => openWs(), 100);
+    });
+    return;
+  }
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+}
 
-async function pullSnapshot(){
+async function pullSnapshot(force = false, tokenAtStart = state.token){
+  if (state.offlineMode && !force) return;
   const j = await api('/api/sync/snapshot');
+  if (tokenAtStart && (!state.token || state.token !== tokenAtStart)) return;
+  return applySnapshot(j, true);
+}
+async function applySnapshot(j, online){
+  const parsed = [];
+  const migrateItems = [];
   for (const it of j.items) {
     if (it.category !== 'host') continue;
-    try { const v = await decValue(it.value); state.hosts.set(it.key, v); }
-    catch(e){ /* unreadable item (wrong password) — skip */ }
+    const env = _decodeMaybeJsonEnvelope(it.value);
+    try {
+      const v = env ? _decAesCbc(env, state.key) : decLegacyValue(it.value);
+      parsed.push({ key: it.key, value: v });
+      if (!env) migrateItems.push({ category: 'host', key: it.key, value: encValue(v), rev: Number(it.rev || 1) });
+    } catch (e) {
+      if (!env) throw new Error(`vault item decrypt failed: ${it.key}`);
+      throw e;
+    }
   }
+  if (online && migrateItems.length) {
+    if (migrateItems.length !== parsed.length) throw new Error('mixed vault versions in snapshot; migration aborted');
+    await api('/api/sync/push', { method: 'POST', body: JSON.stringify({ items: migrateItems }) });
+  }
+  state.hosts.clear();
+  for (const row of parsed) state.hosts.set(row.key, row.value);
   state.lastSync = j.serverTime;
+  const items = online && migrateItems.length ? migrateItems : j.items.filter(it => it.category === 'host');
+  state.encryptedItems = new Map(items.map(it => [it.key, it]));
+  if (online) saveSnapshotCache(items, j.serverTime);
   renderHosts();
 }
 async function pullLatest(){
+  if (state.offlineMode || !state.key) return;
   try {
     const j = await api('/api/sync/pull?since=' + state.lastSync);
+    const hosts = new Map(state.hosts), encrypted = new Map(state.encryptedItems);
     for (const it of j.items) {
       if (it.category !== 'host') continue;
-      if (it.value === null) state.hosts.delete(it.key);
-      else { try { state.hosts.set(it.key, await decValue(it.value)); } catch(e) {} }
+      if (it.value === null) { hosts.delete(it.key); encrypted.delete(it.key); }
+      else { hosts.set(it.key, decValue(it.value)); encrypted.set(it.key, it); }
     }
     state.lastSync = j.serverTime;
+    state.hosts = hosts; state.encryptedItems = encrypted;
+    saveSnapshotCache([...encrypted.values()], state.lastSync);
     renderHosts();
-  } catch(e) {}
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Login online diperlukan.');
+    else if (e.network && leaseValid()) setOfflineMode(true);
+    throw e;
+  }
 }
 async function pushItem(key, value){
+  if (state.readOnly || state.offlineMode) return false;
   try {
     const enc = value === null ? null : await encValue(value);
     await api('/api/sync/push', { method: 'POST', body: JSON.stringify({ items: [{ category: 'host', key, value: enc, rev: 1 }] }) });
-  } catch(e) { toast('gagal simpan: ' + e.message, 'err'); }
+    if (enc === null) state.encryptedItems.delete(key);
+    else state.encryptedItems.set(key, { category: 'host', key, value: enc, rev: 1 });
+    saveSnapshotCache([...state.encryptedItems.values()], state.lastSync);
+    return true;
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
+    else toast('gagal simpan: ' + e.message, 'err');
+    return false;
+  }
 }
 
 // ---------- WS message router ----------
 function onWsMessage(ev){
   let m; try { m = JSON.parse(ev.data); } catch(e){ return; }
-  if (m.type === 'sync') { state.lastSync = 0; pullLatest(); return; }
+  if (m.type === 'sync') { state.lastSync = 0; pullLatest().catch(() => {}); return; }
   const tag = m.data && m.data._tag ? String(m.data._tag) : null;
-  const rec = tag ? state.tabs.get(tag) : null;
-  if (!rec) { const a = [...state.tabs.values()]; if (a.length === 1) return routeMsg(a[0], m); return; }
+  const rec = tag ? state.tabs.get(tag.startsWith('sf:') ? tag.slice(3) : tag) : null;
+  if (!rec) return;
   routeMsg(rec, m);
 }
 function routeMsg(rec, m){
@@ -233,7 +612,7 @@ function routeMsg(rec, m){
     setConnText('connection error');
     setTabBadge(rec, 'err');
   }
-  else if (t === 'sftp-ready') { if (rec.sftp) rec.sftp.opened = true; }
+  else if (t === 'sftp-ready') { if (rec.sftp) { rec.sftp.opened = true; sftpList(rec, rec.sftp.cwd || ''); } }
   else if (t === 'sftp-list') { if (rec.sftp) renderSftpList(rec, m.data); }
   else if (t === 'sftp-error') { if (rec.sftp) { toast('SFTP: ' + (m.data.error || 'error'), 'err'); } }
   else if (t === 'sftp-data' && rec._dl) {
@@ -241,8 +620,9 @@ function routeMsg(rec, m){
   }
   else if (t === 'sftp-end' && rec._dl) { finishDownload(rec); }
   else if (t === 'sftp-ok' && rec._up) {
-    if (rec._up.totalChunks && rec._up.received >= rec._up.totalChunks) finishUpload(rec);
-    else rec._up.received++;
+    rec._up.acked++;
+    if (rec._up.acked >= rec._up.totalChunks) finishUpload(rec);
+    else sendNextUploadChunk(rec);
   }
 }
 function setTabBadge(rec, cls){
@@ -281,6 +661,7 @@ $('hostSearch').addEventListener('input', renderHosts);
 $('addHostBtn').onclick = () => hostModal(null);
 
 function hostModal(existing){
+  if (state.readOnly || state.offlineMode) return;
   const h = existing || { id: 'h' + Date.now() + Math.random().toString(36).slice(2,6), name:'', host:'', port:22, user:'root', auth:'password', password:'', privateKey:'', keyPass:'' };
   const m = $('modal');
   m.innerHTML = `
@@ -305,6 +686,11 @@ function hostModal(existing){
     </div>
     <div id="keyBox" class="${h.auth === 'key' ? '' : 'hidden'}">
       <label>Private Key (PEM — OpenSSH/RSA/Ed25519)</label>
+      <div style="display:flex;gap:8px;margin-bottom:4px">
+        <input type="file" id="f_keyfile" accept=".pem,.key,.ppk,*" style="display:none">
+        <button type="button" id="loadKeyBtn" style="flex:0 0 auto;padding:4px 12px;font-size:0.9em">📂 Load dari File</button>
+        <span id="keyFileName" style="color:#888;font-size:0.9em;line-height:32px"></span>
+      </div>
       <textarea id="f_key" class="mono" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${esc(h.privateKey || '')}</textarea>
       <label>Passphrase (opsional, jika key proteksi)</label>
       <input id="f_keypass" type="password" value="${esc(h.keyPass || '')}">
@@ -324,13 +710,38 @@ function hostModal(existing){
   $('seg_pw').onclick = () => setSeg('password');
   $('seg_key').onclick = () => setSeg('key');
   $('f_cancel').onclick = closeModal;
+  
+  // Load key dari file
+  $('loadKeyBtn').onclick = () => $('f_keyfile').click();
+  $('f_keyfile').onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      $('f_key').value = ev.target.result;
+      $('keyFileName').textContent = file.name;
+      toast(`Key loaded: ${file.name}`, 'ok');
+    };
+    reader.onerror = () => toast('Gagal membaca file', 'err');
+    reader.readAsText(file);
+  };
+  
   if (existing) $('f_del').onclick = () => {
+    if (state.readOnly || state.offlineMode) return;
+    const prev = state.hosts.get(h.id);
     state.hosts.delete(h.id);
-    pushItem(h.id, null);
-    renderHosts(); closeModal();
-    toast('host dihapus & sync', 'ok');
+    pushItem(h.id, null).then(ok => {
+      if (!ok) {
+        if (prev) state.hosts.set(h.id, prev);
+        renderHosts();
+        return;
+      }
+      renderHosts(); closeModal();
+      toast('host dihapus & sync', 'ok');
+    });
   };
   $('f_save').onclick = async () => {
+    if (state.readOnly || state.offlineMode) return;
     const auth = $('seg_key').classList.contains('on') ? 'key' : 'password';
     const nh = {
       id: h.id,
@@ -343,16 +754,88 @@ function hostModal(existing){
     if (auth === 'password') nh.password = $('f_pass').value;
     else { nh.privateKey = $('f_key').value.trim(); nh.keyPass = $('f_keypass').value; }
     if (!nh.host || !nh.user) { toast('host & username wajib diisi', 'err'); return; }
+    const prev = state.hosts.get(nh.id);
     state.hosts.set(nh.id, nh);
-    await pushItem(nh.id, nh);
+    const ok = await pushItem(nh.id, nh);
+    if (!ok) {
+      if (prev) state.hosts.set(nh.id, prev);
+      else state.hosts.delete(nh.id);
+      renderHosts();
+      return;
+    }
     renderHosts(); closeModal();
     toast('tersimpan & tersinkron', 'ok');
   };
 }
 function closeModal(){ $('modalBg').classList.add('hidden'); }
 
+// ---------- TERMINAL CONTEXT MENU ----------
+function showTerminalContextMenu(x, y, rec, selectedText) {
+  // Remove existing menu
+  const existing = document.querySelector('.term-context-menu');
+  if (existing) existing.remove();
+  
+  const menu = document.createElement('div');
+  menu.className = 'term-context-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  
+  const items = [];
+  
+  if (selectedText) {
+    items.push({ label: '📋 Copy', action: () => {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(selectedText).then(() => {
+          toast('Copied to clipboard', 'ok');
+        }).catch(() => {});
+      }
+    }});
+  }
+  
+  items.push({ label: '📄 Paste', action: () => {
+    if (navigator.clipboard) {
+      navigator.clipboard.readText().then(text => {
+        if (text && rec.term) {
+          rec.term.paste(text);
+        }
+      }).catch(() => {});
+    }
+  }});
+  
+  items.push({ label: '🔄 Clear', action: () => {
+    if (rec.term) rec.term.clear();
+  }});
+  
+  items.forEach(item => {
+    const btn = document.createElement('div');
+    btn.className = 'menu-item';
+    btn.textContent = item.label;
+    btn.onclick = () => {
+      item.action();
+      menu.remove();
+    };
+    menu.appendChild(btn);
+  });
+  
+  document.body.appendChild(menu);
+  
+  // Close on click outside
+  setTimeout(() => {
+    const closeMenu = (e) => {
+      if (!menu.contains(e.target)) {
+        menu.remove();
+        document.removeEventListener('click', closeMenu);
+        document.removeEventListener('touchstart', closeMenu);
+      }
+    };
+    document.addEventListener('click', closeMenu);
+    document.addEventListener('touchstart', closeMenu);
+  }, 100);
+}
+
 // ---------- TABS ----------
 function openTab(host){
+  if (isMobile()) toggleSidebar(false);
   if (state.tabs.has(host.id)) { activateTab(host.id); return; }
   const term = new Terminal({
     fontFamily: 'Cascadia Code, Consolas, monospace', fontSize: 13,
@@ -386,6 +869,55 @@ function openTab(host){
   sftpDiv.parentNode.insertBefore(vs, sftpDiv.nextSibling);
   rec.viewSwitch = vs;
   vs.querySelectorAll('button').forEach(b => b.onclick = () => setView(rec, b.dataset.v));
+  
+  // Clipboard support - modern approach with context menu
+  let lastSelection = '';
+  
+  // Keyboard shortcuts
+  term.attachCustomKeyEventHandler(ev => {
+    if (ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
+      const sel = term.getSelection();
+      if (sel && navigator.clipboard) {
+        navigator.clipboard.writeText(sel).catch(() => {});
+      }
+      return false;
+    }
+    if (ev.ctrlKey && ev.key === 'v') {
+      if (navigator.clipboard) {
+        navigator.clipboard.readText().then(text => {
+          if (text) term.paste(text);
+        }).catch(() => {});
+      }
+      return false;
+    }
+    return true;
+  });
+  
+  // Track selection (don't auto-copy on every change to avoid paste duplication)
+  term.onSelectionChange(() => {
+    lastSelection = term.getSelection();
+  });
+  
+  // Right-click & long-press context menu
+  let pressTimer = null;
+  termDiv.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    showTerminalContextMenu(e.clientX, e.clientY, rec, lastSelection);
+  });
+  termDiv.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) {
+      pressTimer = setTimeout(() => {
+        const touch = e.touches[0];
+        showTerminalContextMenu(touch.clientX, touch.clientY, rec, lastSelection);
+      }, 500);
+    }
+  });
+  termDiv.addEventListener('touchend', () => {
+    if (pressTimer) clearTimeout(pressTimer);
+  });
+  termDiv.addEventListener('touchmove', () => {
+    if (pressTimer) clearTimeout(pressTimer);
+  });
 
   activateTab(host.id);
   connectSsh(rec);
@@ -414,14 +946,13 @@ function ensureSftp(rec){
   if (rec._sftpOpened) return;
   rec._sftpOpened = true;
   const h = rec.host;
-  const conn = { host: h.host, port: h.port || 22, username: h.user, _tag: rec.id };
+  const conn = { host: h.host, port: h.port || 22, username: h.user, _tag: 'sf:' + rec.id };
   if (h.auth === 'key') { conn.privateKey = h.privateKey; if (h.keyPass) conn.keyPass = h.keyPass; }
   else conn.password = h.password;
   rec.sftp.cwd = '';
   renderSftpShell(rec);
   wsSend({ type: 'sftp-open', data: conn });
-  // give it a moment then list home
-  setTimeout(() => sftpList(rec, ''), 1200);
+  // Listing is triggered by sftp-ready, never by an arbitrary delay.
 }
 
 function setView(rec, v){
@@ -430,12 +961,10 @@ function setView(rec, v){
   if (v === 'term') {
     rec.termDiv.style.display = '';
     rec.sftpDiv.style.display = 'none';
-    rec.viewSwitch.style.display = 'none';
     rec.fit.fit(); rec.term.focus();
   } else {
     rec.termDiv.style.display = 'none';
     rec.sftpDiv.style.display = '';
-    rec.viewSwitch.style.display = '';
     ensureSftp(rec);
   }
 }
@@ -447,8 +976,9 @@ function activateTab(id){
   $('welcome').style.display = show ? 'none' : '';
   state.tabs.forEach((r, rid) => {
     const vis = String(rid) === String(id);
-    if (r.view === 'term') r.termDiv.style.display = vis ? '' : 'none';
-    else { r.sftpDiv.style.display = vis ? '' : 'none'; r.viewSwitch.style.display = vis ? '' : 'none'; }
+    r.termDiv.style.display = (vis && r.view === 'term') ? '' : 'none';
+    r.sftpDiv.style.display = (vis && r.view === 'sftp') ? '' : 'none';
+    r.viewSwitch.style.display = vis ? '' : 'none';
   });
   const r = state.tabs.get(id);
   if (r && r.view === 'term') { r.fit.fit(); r.term.focus(); }
@@ -457,7 +987,7 @@ function activateTab(id){
 function closeTab(id){
   const r = state.tabs.get(id); if (!r) return;
   wsSend({ type: 'ssh-close', data: { _tag: id } });
-  wsSend({ type: 'sftp-close', data: { _tag: id } });
+  wsSend({ type: 'sftp-close', data: { _tag: 'sf:' + id } });
   r.term.dispose(); r.termDiv.remove(); r.sftpDiv.remove(); r.viewSwitch.remove();
   state.tabs.delete(id);
   const tabEl = document.querySelector(`.tab[data-tab="${id}"]`); if (tabEl) tabEl.remove();
@@ -468,7 +998,29 @@ function closeTab(id){
 function setConnText(t){ $('connText').textContent = t; }
 function resizeAll(){ state.tabs.forEach(r => { try { if (r.view === 'term') r.fit.fit(); } catch(e){} }); }
 
-$('menuBtn').onclick = () => $('sidebar').classList.toggle('open');
+// ---------- SIDEBAR (daftar host) toggle ----------
+// Mobile: sidebar overlay yang digeser masuk/keluar (.open).
+// Desktop: sidebar disembunyikan total (#app.sb-hidden) agar layar terminal lega.
+function isMobile(){
+  try { return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches); }
+  catch(e){ return false; }
+}
+function sidebarVisible(){
+  if (isMobile()) return $('sidebar').classList.contains('open');
+  return !$('app').classList.contains('sb-hidden');
+}
+function toggleSidebar(force){
+  const open = force === undefined ? !sidebarVisible() : !!force;
+  if (isMobile()) $('sidebar').classList.toggle('open', open);
+  else $('app').classList.toggle('sb-hidden', !open);
+  const b = $('menuBtn');
+  if (b) b.title = open ? 'Sembunyikan daftar host' : 'Tampilkan daftar host';
+  const c = $('sbCollapseBtn');
+  if (c) c.title = b ? b.title : c.title;
+  return open;
+}
+$('menuBtn').onclick = () => toggleSidebar();
+$('sbCollapseBtn').onclick = () => toggleSidebar(false);
 document.querySelector('.tab[data-tab="welcome"]').addEventListener('click', () => {
   state.activeTab = 'welcome';
   $('welcome').style.display = '';
@@ -537,7 +1089,7 @@ function sftpList(rec, dir){
   rec.sftp.cwd = dir;
   renderSftpCrumbs(rec);
   rec.$sf.body.innerHTML = '<div class="sftp-loading">Memuat…</div>';
-  wsSend({ type: 'sftp-op', data: { _tag: rec.id, op: 'list', path: dir || '/' } });
+  wsSend({ type: 'sftp-op', data: { _tag: 'sf:' + rec.id, op: 'list', path: dir || '/' } });
 }
 function renderSftpCrumbs(rec){
   const dir = rec.sftp.cwd || '/';
@@ -584,10 +1136,19 @@ function fmtSize(n){
 function sftpOp(rec, data){
   return new Promise(resolve => {
     const prev = rec._sftpPending;
-    const timer = setTimeout(() => resolve(false), 15000);
-    rec._sftpPending = result => { clearTimeout(timer); resolve(result); };
+    const timer = setTimeout(() => {
+      if (rec._sftpPending === pending) rec._sftpPending = null;
+      if (rec.sftp) rec.sftp.opened = false;
+      resolve(false);
+    }, 15000);
+    const pending = result => {
+      clearTimeout(timer);
+      if (rec._sftpPending === pending) rec._sftpPending = null;
+      resolve(result);
+    };
+    rec._sftpPending = pending;
     prev && prev(false);
-    wsSend({ type: 'sftp-op', data: { ...data, _tag: rec.id } });
+    wsSend({ type: 'sftp-op', data: { ...data, _tag: 'sf:' + rec.id } });
   });
 }
 function sftpFileMenu(rec, name, isDir, e){
@@ -622,15 +1183,13 @@ function sftpDownload(rec, path, name){
   if (rec._dl) { toast('download sedang berjalan', 'err'); return; }
   rec._dl = { path, name, buf: [] };
   rec.$sf.foot.textContent = 'Mengunduh ' + name + '…';
-  wsSend({ type: 'sftp-op', data: { _tag: rec.id, op: 'read', path } });
+  wsSend({ type: 'sftp-op', data: { _tag: 'sf:' + rec.id, op: 'read', path } });
 }
 function finishDownload(rec){
   const dl = rec._dl; rec._dl = null;
   try {
-    // concat base64 chunks
-    const bin = atob(dl.buf.join(''));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    // decode each base64 chunk independently to preserve padding boundaries
+    const bytes = new Uint8Array(decodeB64Chunks(dl.buf));
     const blob = new Blob([bytes]);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -653,16 +1212,27 @@ async function sftpUpload(rec, file){
     offset += CHUNK;
   }
   if (!chunks.length) chunks.push({ start: 0, data: '', append: false });
-  rec._up = { name: file.name, received: 0, totalChunks: chunks.length };
+  rec._up = { name: file.name, path: dest, chunks, next: 0, acked: 0, totalChunks: chunks.length };
+  rec._up.done = new Promise(resolve => { rec._up._resolve = resolve; });
   rec.$sf.foot.textContent = `Mengunggah ${file.name} (0/${chunks.length})…`;
-  for (const c of chunks) {
-    wsSend({ type: 'sftp-op', data: { _tag: rec.id, op: 'write', path: dest, ...c } });
-  }
+  sendNextUploadChunk(rec);
+  return rec._up.done;
+}
+function sendNextUploadChunk(rec){
+  if (!rec._up) return;
+  const up = rec._up;
+  if (up.next >= up.totalChunks) return;
+  const c = up.chunks[up.next++];
+  wsSend({ type: 'sftp-op', data: { _tag: 'sf:' + rec.id, op: 'write', path: up.path, ...c } });
+  rec.$sf.foot.textContent = `Mengunggah ${up.name} (${up.acked}/${up.totalChunks})…`;
 }
 function finishUpload(rec){
   const up = rec._up; rec._up = null;
   rec.$sf.foot.textContent = 'SFTP siap';
-  toast('terunggah: ' + up.name, 'ok');
+  if (up) {
+    up._resolve && up._resolve(true);
+    toast('terunggah: ' + up.name, 'ok');
+  }
 }
 function blobToB64(blob){
   return new Promise((res, rej) => {
@@ -689,6 +1259,10 @@ routeMsg = function(rec, m){
 
 // ---------- boot ----------
 (async function boot(){
+  // Auto-fill server URL dari cache saat pertama kali load
+  const cachedServer = localStorage.getItem('tiassh_server') || '';
+  if (cachedServer && $('authServer')) $('authServer').value = cachedServer;
+
   const ok = await tryAutoLogin();
   if (!ok) $('auth').classList.remove('hidden');
 })();

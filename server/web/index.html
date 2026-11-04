@@ -76,7 +76,9 @@ label{font-size:12px;color:var(--muted);display:block;margin:12px 0 5px;font-wei
 .tab .t-ico{font-size:14px}
 .tab .t-x{opacity:.5;font-size:12px;padding:2px 5px;border-radius:4px}
 .tab .t-x:hover{opacity:1;background:var(--panel3)}
-#menuBtn{display:none;padding:8px 12px;background:transparent;color:var(--text);font-size:16px;flex-shrink:0}
+#menuBtn{padding:8px 12px;background:transparent;color:var(--text);font-size:16px;flex-shrink:0;border-radius:8px}
+#menuBtn:hover{background:var(--panel3)}
+#app.sb-hidden #sidebar{display:none}
 .tab .badge-conn{width:7px;height:7px;border-radius:50%;background:var(--green)}
 .tab .badge-conn.err{background:var(--red)}
 .tab .badge-conn.off{background:var(--dim)}
@@ -138,6 +140,13 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
 .toast.err{border-left-color:var(--red)}
 @keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 
+/* ===== TERMINAL CONTEXT MENU ===== */
+.term-context-menu{position:fixed;min-width:160px;background:var(--panel);border:1px solid var(--border2);border-radius:10px;box-shadow:0 8px 30px #00000099;z-index:100;overflow:hidden;animation:tin .15s ease-out}
+.term-context-menu .menu-item{padding:10px 14px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--border);user-select:none;display:flex;align-items:center;gap:8px}
+.term-context-menu .menu-item:last-child{border-bottom:none}
+.term-context-menu .menu-item:hover{background:var(--panel3)}
+.term-context-menu .menu-item:active{background:var(--panel2)}
+
 @media(max-width:768px){
   #sidebar{position:absolute;z-index:30;height:100%;transform:translateX(-100%);transition:transform .2s;box-shadow:0 0 40px #000000aa}
   #sidebar.open{transform:none}
@@ -156,16 +165,20 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
     <div class="auth-sub">SSH client gratis · self-hosted · encrypted</div>
     <label>Server</label>
     <input id="authServer" type="text" placeholder="http://IP-server:8080" autocomplete="off">
-    <label>Email</label>
-    <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="username">
-    <label>Password</label>
-    <input id="authPass" type="password" placeholder="min 6 karakter — menjadi KUNCI enkripsi data Anda" autocomplete="current-password">
+    <div id="authLoginFields">
+      <label>Email</label>
+      <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="username">
+      <label>Password</label>
+      <input id="authPass" type="password" placeholder="password akun" autocomplete="current-password">
+    </div>
+    <label>Passphrase Vault</label>
+    <input id="authVaultPass" type="password" placeholder="(opsional saat login) default = password akun lama" autocomplete="off">
     <div class="auth-err" id="authErr"></div>
     <div class="auth-actions">
       <button class="btn" id="authLoginBtn">Masuk</button>
-      <button class="btn ghost" id="authRegBtn">Buat Akun Baru</button>
     </div>
-    <div class="auth-note">🔒 Zero-knowledge: data SSH Anda dienkripsi di perangkat ini (AES-256-GCM, kunci diturunkan dari password Anda). Server hanya menyimpan ciphertext — tanpa password, data tidak bisa dibaca meski server dibobol.</div>
+    <div class="auth-note" id="authSignupNote">Pendaftaran akun dilakukan di portal web: buka <b>/api/web/register</b> dari browser desktop/mobile lalu kembali login di aplikasi ini.</div>
+    <div class="auth-note">🔒 Passphrase vault hanya dipakai lokal untuk enkripsi/dekripsi dan <b>tidak pernah</b> dikirim ke server. Setelah restart, vault harus dibuka ulang.</div>
   </div>
 </div>
 
@@ -177,6 +190,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
       <div style="display:flex;gap:4px">
         <button class="btn ghost small" id="addHostBtn" title="Tambah host">+ Host</button>
         <button class="btn icon" id="logoutBtn" title="Keluar">⏻</button>
+        <button class="btn icon" id="sbCollapseBtn" title="Sembunyikan daftar host">◀</button>
       </div>
     </div>
     <div class="sb-search"><input id="hostSearch" placeholder="Cari host..." autocomplete="off"></div>
@@ -191,7 +205,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
   </div>
   <div id="main">
     <div id="tabsBar">
-      <button id="menuBtn">☰</button>
+      <button id="menuBtn" title="Tampilkan daftar host">☰</button>
       <div class="tab active" data-tab="welcome"><span class="t-ico">🏠</span>Welcome</div>
     </div>
     <div id="termWrap">
@@ -203,6 +217,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
     </div>
     <div id="statusbar">
       <span><span class="dot" id="syncDot"></span><span id="syncText">sync</span></span>
+      <span id="offlineBanner" class="hidden">Offline · cache terenkripsi · hanya baca</span>
       <span id="connText"></span>
       <span class="spacer"></span>
       <span>TiaSSH 2.0</span>
@@ -217,6 +232,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
 <script src="vendor/xterm-addon-fit.js"></script>
 <script src="vendor/sha256.js"></script>
 <script src="vendor/aesjs.js"></script>
+<script src="android-transport.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
