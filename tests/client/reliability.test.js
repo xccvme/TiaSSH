@@ -111,6 +111,22 @@ test('Android backup is disabled in manifest',()=>{
   const manifest=fs.readFileSync(path.join(root,'android/android/app/src/main/AndroidManifest.xml'),'utf8');
   assert.match(manifest,/android:allowBackup=\"false\"/);
 });
+test('recovery leaves writes locked while complete snapshot request is pending',async()=>{
+  const c=client(); let release;
+  c.context.fetch=async url=>({ok:true,json:async()=>url.endsWith('/api/me')?c.run('({email:state.email,salt:state.salt,issuedAt:state.issuedAt,expiresAt:state.expiresAt})'):new Promise(r=>release=r)});
+  c.run("state.token='t';state.email='u@e';state.salt='salt';state.key={};state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;setOfflineMode(true)");
+  const pending=c.run('recoverOnlineIfPossible()');await new Promise(setImmediate);
+  assert.equal(c.run('state.readOnly'),true); assert.equal(c.run('state.offlineMode'),true);
+  release({items:[],serverTime:1}); assert.equal(await pending,true);
+});
+test('snapshot response pending at logout cannot resurrect hosts or cache',async()=>{
+ const c=client();let release;
+ c.context.fetch=()=>new Promise(r=>release=r);
+ c.run("state.token='t';state.key={};state.hosts.set('h',{id:'h'});");
+ const p=c.run('pullSnapshot()'); c.run('logoutSession()');
+ release({ok:true,json:async()=>({items:[],serverTime:5})});await p.catch(()=>{});
+ assert.equal(c.storage.has('tiassh_snapshot_cache'),false);assert.equal(c.run('state.lastSync'),0);
+});
 test('native auth screen has no register button and gives web signup guidance',()=>{
   const html=fs.readFileSync(path.join(root,'web/index.html'),'utf8');
   assert.equal(html.includes('id="authRegBtn"'),false);

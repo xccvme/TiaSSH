@@ -76,6 +76,7 @@ function migrate(db) {
     add('users', 'display_name', "TEXT NOT NULL DEFAULT ''");
 
     add('sessions', 'scope', "TEXT NOT NULL DEFAULT 'client'");
+    add('sessions', 'issued_at', 'INTEGER NOT NULL DEFAULT 0');
     add('sessions', 'expires_at', 'INTEGER NOT NULL DEFAULT 0');
     add('sessions', 'revoked', 'INTEGER NOT NULL DEFAULT 0');
     add('sessions', 'auth_revision', 'INTEGER NOT NULL DEFAULT 1');
@@ -112,15 +113,15 @@ function issueSession(db, userId, scope, ttlSec = 7 * 24 * 3600) {
   const user = db.prepare('SELECT auth_revision FROM users WHERE id=?').get(userId);
   if (!user) return null;
   const now = Date.now();
-  db.prepare('INSERT INTO sessions(token,user_id,scope,expires_at,revoked,auth_revision,created_at) VALUES(?,?,?,?,?,?,datetime(\'now\'))')
-    .run(token, userId, scope, now + ttlSec * 1000, 0, user.auth_revision);
+  db.prepare('INSERT INTO sessions(token,user_id,scope,issued_at,expires_at,revoked,auth_revision,created_at) VALUES(?,?,?,?,?,?,?,datetime(\'now\'))')
+    .run(token, userId, scope, now, now + ttlSec * 1000, 0, user.auth_revision);
   return token;
 }
 
 function lookupSession(db, token, scope) {
   if (!token || typeof token !== 'string') return null;
   const row = db.prepare(`
-    SELECT s.token,s.user_id,s.scope,s.expires_at,s.revoked,s.auth_revision AS session_auth_revision,
+    SELECT s.token,s.user_id,s.scope,s.issued_at,s.expires_at,s.revoked,s.auth_revision AS session_auth_revision,
            u.email,u.salt,u.auth_revision,u.totp_secret,u.last_otp,u.pass_hash,u.display_name
     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?
   `).get(token);
@@ -133,6 +134,8 @@ function lookupSession(db, token, scope) {
     token: row.token,
     id: row.user_id,
     scope: row.scope,
+    issuedAt: row.issued_at,
+    expiresAt: row.expires_at,
     email: row.email,
     salt: row.salt,
     authRevision: row.auth_revision,

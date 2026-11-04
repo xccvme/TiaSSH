@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "description": "TiaSSH - Free self-hosted SSH client (Termius-like) - desktop",
   "main": "main.js",
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  },
   "author": "Tia",
   "license": "WTFPL",
   "scripts": {
@@ -20,6 +23,8 @@
     "productName": "TiaSSH",
     "files": [
       "main.js",
+      "preload.js",
+      "transport.js",
       "web/**/*"
     ],
     "win": {

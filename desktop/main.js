@@ -1,9 +1,61 @@
-const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
+const { app, BrowserWindow, Menu, shell, ipcMain } = require('electron');
 const path = require('path');
+const { Client } = require('ssh2');
+const { CHANNELS, createTransport } = require('./transport');
 
 // Single instance
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
+
+function wireNativeTransport(win) {
+  const appEntryUrl = new URL('file://' + path.join(__dirname, 'web', 'index.html')).href;
+  const transport = createTransport({
+    pinStorePath: path.join(app.getPath('userData'), 'ssh-host-pins.json'),
+    createClient: () => new Client(),
+    send: payload => {
+      if (!win.isDestroyed()) win.webContents.send('native-transport:event', payload);
+    }
+  });
+
+  const isTrustedRendererCall = event => {
+    const frame = event.senderFrame;
+    return event.sender === win.webContents && frame === win.webContents.mainFrame && (!frame || !frame.url || frame.url === appEntryUrl);
+  };
+
+  const handler = (event, message) => {
+    if (!isTrustedRendererCall(event)) return;
+    if (!message || typeof message !== 'object' || !CHANNELS.includes(message.type)) return;
+    try { transport.handle(message); }
+    catch (error) {
+      const tag = message && message.data && typeof message.data._tag === 'string' ? message.data._tag : '';
+      const type = String(message.type || '').startsWith('sftp-') ? 'sftp-error' : 'ssh-error';
+      if (tag) win.webContents.send('native-transport:event', { type, data: { _tag: tag, error: String(error.message || error) } });
+    }
+  };
+
+  const closeAllHandler = event => {
+    if (!isTrustedRendererCall(event)) return;
+    transport.dispose();
+  };
+
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    ipcMain.removeListener('native-transport:send', handler);
+    ipcMain.removeListener('native-transport:close-all', closeAllHandler);
+    transport.dispose();
+  };
+
+  ipcMain.on('native-transport:send', handler);
+  ipcMain.on('native-transport:close-all', closeAllHandler);
+  win.on('closed', dispose);
+  app.once('before-quit', dispose);
+  win.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (!isInPlace && isMainFrame) transport.dispose();
+  });
+  win.webContents.on('will-navigate', event => event.preventDefault());
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -16,6 +68,7 @@ function createWindow() {
     autoHideMenuBar: true,
     icon: path.join(__dirname, 'icon.png'),
     webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
@@ -27,6 +80,7 @@ function createWindow() {
     return { action: 'deny' };
   });
   win.on('page-title-updated', e => e.preventDefault());
+  wireNativeTransport(win);
 }
 
 app.whenReady().then(() => {

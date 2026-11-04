@@ -358,15 +358,17 @@ test('read-only mode blocks host write actions', async () => {
   assert.equal(c.fetchCalls.filter(x => String(x.url).endsWith('/api/sync/push')).length, 0);
 });
 
-test('online recovery exits read-only mode and pulls latest snapshot delta', async () => {
+test('online recovery exits read-only mode only after successful full snapshot sync', async () => {
   const salt = Buffer.from('legacy-salt').toString('base64');
+  let snapshotCalls = 0;
   const c = makeClient({
     fetchImpl: async (url) => {
       if (url.endsWith('/api/me')) {
         const now = Date.now();
         return { ok: true, json: async () => ({ email: 'u@e', salt, issuedAt: now - 1000, expiresAt: now + 100000 }) };
       }
-      if (url.includes('/api/sync/pull?since=')) {
+      if (url.endsWith('/api/sync/snapshot')) {
+        snapshotCalls++;
         return {
           ok: true,
           json: async () => ({
@@ -375,21 +377,123 @@ test('online recovery exits read-only mode and pulls latest snapshot delta', asy
           })
         };
       }
+      if (url.includes('/api/sync/pull?since=')) throw new Error('delta pull must not be used for recovery unlock');
       return { ok: true, json: async () => ({ ok: true }) };
     }
   });
   c.run(`
+    state.token = 'tok';
     state.salt = '${salt}'; state.email = 'u@e';
     state.key = deriveKey('vault-pass', state.salt);
+    state.issuedAt = Date.now() - 1000;
+    state.expiresAt = Date.now() + 100000;
     state.readOnly = true;
     state.offlineMode = true;
     state.lastSync = 0;
   `);
   await c.run('recoverOnlineIfPossible()');
+  assert.equal(snapshotCalls, 1);
   assert.equal(c.run('state.readOnly'), false);
   assert.equal(c.run('state.offlineMode'), false);
   assert.equal(c.run("state.hosts.get('h2').host"), '2.2.2.2');
 });
+
+test('recovery keeps read-only mode if snapshot sync fails', async () => {
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/me')) {
+        const now = Date.now();
+        return { ok: true, json: async () => ({ email: 'u@e', salt, issuedAt: now - 1000, expiresAt: now + 100000 }) };
+      }
+      if (url.endsWith('/api/sync/snapshot')) throw Object.assign(new Error('offline again'), { network: true });
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+  c.run(`
+    state.token = 'tok';
+    state.salt = '${salt}'; state.email = 'u@e';
+    state.key = deriveKey('vault-pass', state.salt);
+    state.issuedAt = Date.now() - 1000;
+    state.expiresAt = Date.now() + 100000;
+    state.readOnly = true;
+    state.offlineMode = true;
+    state.lastSync = 0;
+  `);
+  const ok = await c.run('recoverOnlineIfPossible()');
+  assert.equal(ok, false);
+  assert.equal(c.run('state.readOnly'), true);
+  assert.equal(c.run('state.offlineMode'), true);
+});
+
+test('auto-login fails closed when endpoint changed locally before restore', async () => {
+  const now = Date.now();
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({ fetchImpl: async () => ({ ok: true, json: async () => ({ email: 'u@e', salt, issuedAt: now, expiresAt: now + 1000 }) }) });
+  c.storage.set('tiassh_server', 'https://other-endpoint');
+  c.storage.set('tiassh_session', JSON.stringify({ token: 'tok', email: 'u@e', salt, server: 'https://srv', issuedAt: now - 1000, expiresAt: now + 100000 }));
+  const ok = await c.run('tryAutoLogin()');
+  assert.equal(ok, false);
+  assert.equal(c.fetchCalls.length, 0);
+  assert.equal(c.storage.get('tiassh_session') || null, null);
+});
+
+test('host save does not show success or mutate host when push fails', async () => {
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/sync/push')) return { ok: false, status: 503, json: async () => ({ error: 'push failed' }) };
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+  c.run(`
+    globalThis._toasts = [];
+    toast = (m, k) => _toasts.push({ m, k });
+    state.token = 'tok';
+    state.salt = '${salt}';
+    state.key = deriveKey('vault-pass', state.salt);
+    state.hosts.set('h1', { id:'h1', name:'old', host:'10.0.0.1', user:'root', auth:'password', password:'a' });
+    hostModal(state.hosts.get('h1'));
+    $('f_host').value = '10.0.0.2';
+  `);
+  await c.run("$('f_save').onclick()");
+  assert.equal(c.run("state.hosts.get('h1').host"), '10.0.0.1');
+  assert.equal(c.run('_toasts.some(t => /tersimpan/.test(t.m))'), false);
+  assert.equal(c.run("$('modalBg').classList.contains('hidden')"), false);
+});
+
+test('enforceLeaseValidity logs out on clock rollback while app is running', () => {
+  const c = makeClient();
+  c.ctx.base = Date.now();
+  c.run("state.token='tok'; state.key={encKey:[],macKey:[]}; state.issuedAt=base-1000; state.expiresAt=base+100000; state.leaseSeenAt=base;");
+  const stillValid = c.run('enforceLeaseValidity(base + 1)');
+  assert.equal(stillValid, true);
+  const rolledBack = c.run('enforceLeaseValidity(base)');
+  assert.equal(rolledBack, false);
+  assert.equal(c.run('state.token'), null);
+});
+
+test('pushItem reports failure explicitly when sync push fails', async () => {
+  const salt = Buffer.from('legacy-salt').toString('base64');
+  const c = makeClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/sync/push')) return { ok: false, status: 500, json: async () => ({ error: 'boom' }) };
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+  });
+  c.run(`state.token='tok'; state.salt='${salt}'; state.key=deriveKey('vault-pass', state.salt);`);
+  const ok = await c.run(`pushItem('h1', {id:'h1',host:'x',user:'root',auth:'password',password:'p'})`);
+  assert.equal(ok, false);
+});
+
+test('API rejection during push scrubs authenticated state', async () => {
+  const c = makeClient({fetchImpl: async () => ({ok:false,status:403,json:async()=>({error:'rejected'})})});
+  c.run("state.token='tok'; state.key={encKey:new Array(32).fill(0),macKey:new Array(32).fill(0)}; state.hosts.set('h',{id:'h'});");
+  await c.run("pushItem('h',null)");
+  assert.equal(c.run('state.token'), null);
+  assert.equal(c.run('state.hosts.size'), 0);
+});
+
 
 test('legacy ciphertext decrypts and full legacy snapshot migrates to v2 envelope', async () => {
   const salt = Buffer.from('legacy-salt').toString('base64');

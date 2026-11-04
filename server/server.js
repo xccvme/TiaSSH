@@ -53,6 +53,7 @@ const WEB_ORIGIN = process.env.WEB_ORIGIN || PUBLIC_URL;
 // can forge or omit Origin. Credentials and scoped sessions remain required.
 const NATIVE_ORIGINS = new Set(String(process.env.NATIVE_ORIGINS || 'tauri://localhost,http://tauri.localhost,null,https://localhost,http://localhost').split(',').map(v => v.trim()).filter(Boolean));
 const SESSION_TTL_SEC = Math.max(300, parseInt(process.env.SESSION_TTL_SEC || '3600', 10));
+const CLIENT_SESSION_TTL_SEC = Math.min(129600, Math.max(1, parseInt(process.env.CLIENT_SESSION_TTL_SEC || '129600', 10)));
 const security = require('./account-security');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -101,7 +102,11 @@ CREATE TABLE IF NOT EXISTS devices(
 
 // ---------- app ----------
 security.migrate(db);
-function makeToken(userId) { return security.issueSession(db, userId, 'client'); }
+function makeClientSession(userId) {
+  const token = security.issueSession(db, userId, 'client', CLIENT_SESSION_TTL_SEC);
+  if (!token) return null;
+  return security.lookupSession(db, token, 'client');
+}
 function verifyToken(token) { return security.lookupSession(db, token, 'client')?.id || null; }
 function auth(req, res, next) {
   const h = req.headers['authorization'] || '';
@@ -166,13 +171,18 @@ app.post('/api/login', (req, res) => {
   if (typeof email !== 'string' || typeof password !== 'string' || !email || !password || Buffer.byteLength(password) > 72) return res.status(400).json({ error: 'email + password required' });
   const u = db.prepare('SELECT * FROM users WHERE email=?').get(String(email).toLowerCase());
   if (!u || !bcrypt.compareSync(password, u.pass_hash)) return res.status(401).json({ error: 'invalid credentials' });
-  const token = makeToken(u.id);
-  res.json({ token, email: u.email, salt: u.salt });
+  const session = makeClientSession(u.id);
+  if (!session) return res.status(500).json({ error: 'session issue failed' });
+  res.json({ token: session.token, email: u.email, salt: u.salt, issuedAt: session.issuedAt, expiresAt: session.expiresAt, expires_at: session.expiresAt });
 });
 
 app.get('/api/me', auth, (req, res) => {
+  const h = req.headers['authorization'] || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  const session = security.lookupSession(db, token, 'client');
+  if (!session) return res.status(401).json({ error: 'unauthorized' });
   const u = db.prepare('SELECT email, salt, auth_revision FROM users WHERE id=?').get(req.uid);
-  res.json({ email: u.email, salt: u.salt, authRevision: u.auth_revision });
+  res.json({ email: u.email, salt: u.salt, authRevision: u.auth_revision, issuedAt: session.issuedAt, expiresAt: session.expiresAt, expires_at: session.expiresAt });
 });
 
 app.post('/api/device', auth, (req, res) => {

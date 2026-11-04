@@ -24,10 +24,15 @@ function wsBase(){
 const state = {
   token: null, email: null, salt: null,
   key: null, legacyKey: null,
-  unlockRequired: false,
+  unlockRequired: false, issuedAt: null, expiresAt: null, leaseSeenAt: null,
+  readOnly: false, offlineMode: false, encryptedItems: new Map(),
   hosts: new Map(), lastSync: 0, ws: null, tabs: new Map(),
   activeTab: 'welcome'
 };
+
+const nativeTransport = window.tiasshNativeTransport;
+const hasNativeTransport = !!(nativeTransport && nativeTransport.available && typeof nativeTransport.send === 'function');
+if (hasNativeTransport) nativeTransport.onEvent(m => onWsMessage({ data: JSON.stringify(m) }));
 
 // ---------- crypto (zero-knowledge, pure JS — works over http, byte-identical across devices) ----------
 // Scheme: PBKDF2-SHA256(password, serverSalt, 100000) -> 64 bytes = encKey(32) | macKey(32)
@@ -164,21 +169,148 @@ function decValue(raw){
   return decLegacyValue(String(raw || '').trim());
 }
 
+// ---------- local lease and ciphertext cache ----------
+const LOCAL_LEASE_MS = 36 * 60 * 60 * 1000;
+function leaseFields(s){
+  const issuedAt = s && (s.issuedAt !== undefined ? s.issuedAt : s.issued_at);
+  const expiresAt = s && (s.expiresAt !== undefined ? s.expiresAt : s.expires_at);
+  return { issuedAt, expiresAt };
+}
+function leaseValid(s = state, now = Date.now()){
+  const { issuedAt, expiresAt } = leaseFields(s);
+  return Number.isSafeInteger(issuedAt) && Number.isSafeInteger(expiresAt) &&
+    issuedAt > 0 && expiresAt > issuedAt && now >= issuedAt &&
+    (!s.leaseSeenAt || now >= s.leaseSeenAt) &&
+    now < Math.min(expiresAt, issuedAt + LOCAL_LEASE_MS);
+}
+function applyLease(s){
+  const next = leaseFields(s);
+  if (!Number.isSafeInteger(next.issuedAt) || !Number.isSafeInteger(next.expiresAt)) throw new Error('invalid session lease');
+  Object.assign(state, next);
+  state.leaseSeenAt = Date.now();
+}
+function cacheScope(){ return { server: apiBase(), email: state.email, salt: state.salt }; }
+function saveSnapshotCache(items, serverTime){
+  try {
+    localStorage.setItem('tiassh_snapshot_cache', JSON.stringify({
+      v: 1, ...cacheScope(), items: items.map(it => ({ category: it.category, key: it.key, value: it.value, rev: it.rev })),
+      serverTime, cachedAt: Date.now()
+    }));
+    return true;
+  } catch(e) { return false; } // Quota/disabled storage must not break online sync.
+}
+function loadSnapshotCache(){
+  try {
+    const c = JSON.parse(localStorage.getItem('tiassh_snapshot_cache') || 'null');
+    const scope = cacheScope();
+    if (!c || c.v !== 1 || c.server !== scope.server || c.email !== scope.email || c.salt !== scope.salt ||
+        !Array.isArray(c.items) || !Number.isFinite(c.serverTime) ||
+        c.items.some(it => !it || it.category !== 'host' || typeof it.key !== 'string' || typeof it.value !== 'string')) return null;
+    return c;
+  } catch(e) { return null; }
+}
+function setOfflineMode(on){
+  state.offlineMode = on; state.readOnly = on;
+  $('addHostBtn').disabled = on;
+  $('offlineBanner').classList.toggle('hidden', !on);
+  $('offlineBanner').textContent = 'Offline · cache terenkripsi · hanya baca. Login online wajib setelah lease berakhir.';
+  if (on) {
+    closeModal(); setSync(false);
+    clearTimeout(state.wsRetryTimer);
+    if (state.ws) { const ws = state.ws; state.ws = null; ws.close(); }
+    scheduleRecovery();
+  }
+}
+function scheduleLeaseExpiry(){
+  clearTimeout(state.leaseTimer);
+  if (!leaseValid()) return;
+  const ms = Math.min(state.expiresAt, state.issuedAt + LOCAL_LEASE_MS) - Date.now();
+  if (ms <= 0) { logoutSession('Lease berakhir. Login online diperlukan.'); return; }
+  state.leaseTimer = setTimeout(() => logoutSession('Lease berakhir. Login online diperlukan.'), ms);
+}
+function enforceLeaseValidity(now = Date.now()){
+  if (!state.token) return true;
+  if (!leaseValid(state, now)) {
+    logoutSession('Lease berakhir. Login online diperlukan.');
+    return false;
+  }
+  state.leaseSeenAt = now;
+  saveSession();
+  scheduleLeaseExpiry();
+  return true;
+}
+function logoutSession(message){
+  state.wsStopped = true;
+  if (hasNativeTransport) nativeTransport.closeAll().catch(() => {});
+  clearTimeout(state.wsRetryTimer); clearTimeout(state.recoveryTimer); clearTimeout(state.leaseTimer);
+  if (state.ws) { const ws = state.ws; state.ws = null; ws.close(); }
+  state.token = null; state.key = null; state.legacyKey = null; state.unlockRequired = false;
+  state.hosts.clear(); state.encryptedItems.clear(); state.tabs.forEach(r => { if (r.term) r.term.dispose && r.term.dispose(); }); state.tabs.clear();
+  state.issuedAt = null; state.expiresAt = null;
+  state.readOnly = false; state.offlineMode = false;
+  clearSession();
+  $('app').classList.add('hidden'); $('auth').classList.remove('hidden');
+  $('authLoginFields').classList.remove('hidden'); $('authLoginBtn').textContent = 'Login';
+  $('authPass').value = ''; $('authVaultPass').value = ''; $('authErr').textContent = message || '';
+  $('hostList').innerHTML = ''; $('modal').innerHTML = '';
+}
+function scheduleRecovery(){
+  clearTimeout(state.recoveryTimer);
+  state.recoveryTimer = setTimeout(() => recoverOnlineIfPossible(), 10000);
+}
+async function recoverOnlineIfPossible(){
+  if (!state.offlineMode || state.recovering) return false;
+  if (state.token && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+  const tokenAtStart = state.token;
+  state.recovering = true;
+  try {
+    const me = await api('/api/me');
+    if (me.salt !== state.salt || me.email !== state.email) throw new Error('session identity changed');
+    applyLease(me);
+    if (!leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+    saveSession(); scheduleLeaseExpiry();
+    if (state.key) await pullSnapshot(true, tokenAtStart);
+    if (state.token !== tokenAtStart || !state.token) return false;
+    state.offlineMode = false; state.readOnly = false;
+    $('addHostBtn').disabled = false;
+    $('offlineBanner').classList.add('hidden');
+    if (state.key) { state.wsStopped = false; openWs(); }
+    return true;
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
+    else if (state.token) { setOfflineMode(true); }
+    return false;
+  } finally { state.recovering = false; }
+}
+if (window && typeof window.addEventListener === 'function') {
+  window.addEventListener('online', () => recoverOnlineIfPossible());
+  window.addEventListener('focus', () => enforceLeaseValidity());
+}
+if (document && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') enforceLeaseValidity();
+  });
+}
+
 // ---------- session persistence ----------
 function saveSession(){
   localStorage.setItem('tiassh_session', JSON.stringify({
     token: state.token, email: state.email, salt: state.salt,
+    issuedAt: state.issuedAt, expiresAt: state.expiresAt, leaseSeenAt: state.leaseSeenAt,
     server: localStorage.getItem('tiassh_server') || ''
   }));
 }
 function loadSession(){
   try {
     const s = JSON.parse(localStorage.getItem('tiassh_session') || 'null');
-    if (s && s.token) return s;
+    if (s && s.token) return { ...s, ...leaseFields(s) };
   } catch(e){}
   return null;
 }
-function clearSession(){ localStorage.removeItem('tiassh_session'); }
+function clearSession(){
+  localStorage.removeItem('tiassh_session');
+  localStorage.removeItem('tiassh_snapshot_cache');
+}
 
 // ---------- toast ----------
 function toast(msg, kind){
@@ -191,9 +323,11 @@ function toast(msg, kind){
 
 // ---------- api ----------
 async function api(path, opts={}){
-  const res = await fetch(apiBase()+path, { ...opts, headers: { 'Content-Type':'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}), ...(opts.headers || {}) } });
+  let res;
+  try { res = await fetch(apiBase()+path, { ...opts, headers: { 'Content-Type':'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}), ...(opts.headers || {}) } }); }
+  catch(e) { e.network = true; throw e; }
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(j.error || ('HTTP ' + res.status));
+  if (!res.ok) { const e = new Error(j.error || ('HTTP ' + res.status)); e.status = res.status; throw e; }
   return j;
 }
 
@@ -220,6 +354,7 @@ async function doLogin(){
     const vaultPass = $('authVaultPass').value || pass;
     const j = await api('/api/login', { method: 'POST', body: JSON.stringify({ email, password: pass }) });
     state.token = j.token; state.email = j.email; state.salt = j.salt;
+    state.wsStopped = false; applyLease(j); setOfflineMode(false); scheduleLeaseExpiry();
     $('authPass').value = '';
     saveSession();
     showUnlock();
@@ -241,12 +376,23 @@ async function unlockVault(passphrase){
   try {
     state.key = deriveKey(passphrase, state.salt);
     state.legacyKey = deriveLegacyKey(passphrase, state.salt);
-    await pullSnapshot();
+    if (state.offlineMode && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); throw new Error('Lease berakhir'); }
+    if (state.offlineMode) {
+      const cached = loadSnapshotCache();
+      if (!cached) throw new Error('Cache tidak tersedia. Login online diperlukan.');
+      await applySnapshot(cached, false);
+    } else {
+      try { await pullSnapshot(); } catch(e) {
+        const cached = loadSnapshotCache();
+        if (!e.network || !leaseValid() || !cached) throw e;
+        setOfflineMode(true); await applySnapshot(cached, false);
+      }
+    }
     state.unlockRequired = false;
     $('authVaultPass').value = '';
     enterApp();
   } catch(e) {
-    state.key = null; state.legacyKey = null; state.unlockRequired = true;
+    state.key = null; state.legacyKey = null; state.unlockRequired = !!state.token;
     throw e;
   }
 }
@@ -254,25 +400,36 @@ async function unlockVault(passphrase){
 async function tryAutoLogin(){
   const s = loadSession();
   if (!s) return false;
+  const configuredServer = (localStorage.getItem('tiassh_server') || '').replace(/\/+$/,'');
+  const sessionServer = String(s.server || '').replace(/\/+$/,'');
+  if (configuredServer && sessionServer && configuredServer !== sessionServer) {
+    logoutSession('Endpoint berubah. Login online diperlukan.');
+    return false;
+  }
   // Sanitize sessions saved by older clients before making any request.
   localStorage.setItem('tiassh_server', s.server || '');
   state.token = s.token; state.email = s.email; state.salt = s.salt;
+  Object.assign(state, leaseFields(s));
+  state.leaseSeenAt = s.leaseSeenAt || null;
+  if (state.issuedAt && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
   saveSession();
   try {
     const me = await api('/api/me');
     state.email = me.email; state.salt = me.salt;
+    applyLease(me); setOfflineMode(false); scheduleLeaseExpiry();
     saveSession();
     showUnlock();
     return true;
-  } catch(e) { state.token = null; clearSession(); return false; }
+  } catch(e) {
+    if (e.network && leaseValid() && loadSnapshotCache()) {
+      setOfflineMode(true); scheduleLeaseExpiry(); showUnlock(); return true;
+    }
+    logoutSession('Login online diperlukan.'); return false;
+  }
 }
 
 $('logoutBtn').onclick = () => {
-  state.wsStopped = true;
-  clearTimeout(state.wsRetryTimer);
-  if (state.ws) { try { state.ws.close(); } catch {} }
-  state.ws = null;
-  clearSession();
+  logoutSession();
   location.reload();
 };
 
@@ -282,21 +439,30 @@ function enterApp(){
   $('app').classList.remove('hidden');
   $('userLine').textContent = state.email;
   $('avatarEl').textContent = (state.email[0] || '?').toUpperCase();
-  api('/api/device', { method: 'POST', body: JSON.stringify({ name: /Mobi|Android/i.test(navigator.userAgent) ? 'android' : 'desktop' }) }).catch(() => {});
-  openWs();
-  pullSnapshot().catch(e => toast('gagal ambil data: ' + e.message, 'err'));
+  if (!state.offlineMode) {
+    api('/api/device', { method: 'POST', body: JSON.stringify({ name: /Mobi|Android/i.test(navigator.userAgent) ? 'android' : 'desktop' }) }).catch(() => {});
+    openWs();
+  }
   window.addEventListener('resize', resizeAll);
 }
 
 // ---------- SYNC (zero-knowledge) ----------
 function openWs(){
-  if (!state.token || state.wsStopped) return;
+  if (!state.token || state.wsStopped || state.offlineMode) return;
+  if (hasNativeTransport && !leaseValid()) return;
+  if (hasNativeTransport) {
+    state.wsRetries = 0;
+    setSync(true);
+    state.tabs.forEach(rec => { connectSsh(rec); if (rec.view === 'sftp') ensureSftp(rec); });
+    return;
+  }
   if (state.ws && state.ws.readyState < 2) return;
   const ws = new WebSocket(`${wsBase()}/ws?token=${encodeURIComponent(state.token)}`);
   ws.onmessage = onWsMessage;
   ws.onclose = ev => {
     if (state.ws !== ws || state.wsStopped) return;
     setSync(false);
+    if (state.key && leaseValid()) { setOfflineMode(true); return; }
     const delay = Math.min(30000, 1000 * Math.pow(2, state.wsRetries || 0));
     state.wsRetries = (state.wsRetries || 0) + 1;
     $('syncText').textContent = `reconnect ${delay / 1000}s · ${ev && ev.code || 'network'} · periksa endpoint /ws, jaringan, TLS`;
@@ -316,10 +482,24 @@ function setSync(on){
   $('syncText').textContent = on ? 'sync aktif' : 'reconnect…';
   $('userStatus').textContent = on ? 'terhubung · terenkripsi' : 'tersinkron terakhir tersimpan';
 }
-function wsSend(obj){ if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj)); }
+function wsSend(obj){
+  const isRemote = /^(ssh|sftp)-/.test(obj.type);
+  if (isRemote && (!state.token || state.wsStopped || (hasNativeTransport && !leaseValid()))) return;
+  if (!hasNativeTransport && isRemote && state.offlineMode) return;
+  if (hasNativeTransport && isRemote) {
+    nativeTransport.send(obj).catch(e => onWsMessage({ data: JSON.stringify({ type: obj.type.startsWith('sftp-') ? 'sftp-error' : 'ssh-error', data: { _tag: obj.data._tag, error: String(e.message || e) } }) }));
+    return;
+  }
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+}
 
-async function pullSnapshot(){
+async function pullSnapshot(force = false, tokenAtStart = state.token){
+  if (state.offlineMode && !force) return;
   const j = await api('/api/sync/snapshot');
+  if (tokenAtStart && (!state.token || state.token !== tokenAtStart)) return;
+  return applySnapshot(j, true);
+}
+async function applySnapshot(j, online){
   const parsed = [];
   const migrateItems = [];
   for (const it of j.items) {
@@ -334,38 +514,58 @@ async function pullSnapshot(){
       throw e;
     }
   }
-  if (migrateItems.length) {
+  if (online && migrateItems.length) {
     if (migrateItems.length !== parsed.length) throw new Error('mixed vault versions in snapshot; migration aborted');
     await api('/api/sync/push', { method: 'POST', body: JSON.stringify({ items: migrateItems }) });
   }
   state.hosts.clear();
   for (const row of parsed) state.hosts.set(row.key, row.value);
   state.lastSync = j.serverTime;
+  const items = online && migrateItems.length ? migrateItems : j.items.filter(it => it.category === 'host');
+  state.encryptedItems = new Map(items.map(it => [it.key, it]));
+  if (online) saveSnapshotCache(items, j.serverTime);
   renderHosts();
 }
 async function pullLatest(){
+  if (state.offlineMode || !state.key) return;
   try {
     const j = await api('/api/sync/pull?since=' + state.lastSync);
+    const hosts = new Map(state.hosts), encrypted = new Map(state.encryptedItems);
     for (const it of j.items) {
       if (it.category !== 'host') continue;
-      if (it.value === null) state.hosts.delete(it.key);
-      else state.hosts.set(it.key, decValue(it.value));
+      if (it.value === null) { hosts.delete(it.key); encrypted.delete(it.key); }
+      else { hosts.set(it.key, decValue(it.value)); encrypted.set(it.key, it); }
     }
     state.lastSync = j.serverTime;
+    state.hosts = hosts; state.encryptedItems = encrypted;
+    saveSnapshotCache([...encrypted.values()], state.lastSync);
     renderHosts();
-  } catch(e) {}
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Login online diperlukan.');
+    else if (e.network && leaseValid()) setOfflineMode(true);
+    throw e;
+  }
 }
 async function pushItem(key, value){
+  if (state.readOnly || state.offlineMode) return false;
   try {
     const enc = value === null ? null : await encValue(value);
     await api('/api/sync/push', { method: 'POST', body: JSON.stringify({ items: [{ category: 'host', key, value: enc, rev: 1 }] }) });
-  } catch(e) { toast('gagal simpan: ' + e.message, 'err'); }
+    if (enc === null) state.encryptedItems.delete(key);
+    else state.encryptedItems.set(key, { category: 'host', key, value: enc, rev: 1 });
+    saveSnapshotCache([...state.encryptedItems.values()], state.lastSync);
+    return true;
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
+    else toast('gagal simpan: ' + e.message, 'err');
+    return false;
+  }
 }
 
 // ---------- WS message router ----------
 function onWsMessage(ev){
   let m; try { m = JSON.parse(ev.data); } catch(e){ return; }
-  if (m.type === 'sync') { state.lastSync = 0; pullLatest(); return; }
+  if (m.type === 'sync') { state.lastSync = 0; pullLatest().catch(() => {}); return; }
   const tag = m.data && m.data._tag ? String(m.data._tag) : null;
   const rec = tag ? state.tabs.get(tag.startsWith('sf:') ? tag.slice(3) : tag) : null;
   if (!rec) return;
@@ -433,6 +633,7 @@ $('hostSearch').addEventListener('input', renderHosts);
 $('addHostBtn').onclick = () => hostModal(null);
 
 function hostModal(existing){
+  if (state.readOnly || state.offlineMode) return;
   const h = existing || { id: 'h' + Date.now() + Math.random().toString(36).slice(2,6), name:'', host:'', port:22, user:'root', auth:'password', password:'', privateKey:'', keyPass:'' };
   const m = $('modal');
   m.innerHTML = `
@@ -477,12 +678,21 @@ function hostModal(existing){
   $('seg_key').onclick = () => setSeg('key');
   $('f_cancel').onclick = closeModal;
   if (existing) $('f_del').onclick = () => {
+    if (state.readOnly || state.offlineMode) return;
+    const prev = state.hosts.get(h.id);
     state.hosts.delete(h.id);
-    pushItem(h.id, null);
-    renderHosts(); closeModal();
-    toast('host dihapus & sync', 'ok');
+    pushItem(h.id, null).then(ok => {
+      if (!ok) {
+        if (prev) state.hosts.set(h.id, prev);
+        renderHosts();
+        return;
+      }
+      renderHosts(); closeModal();
+      toast('host dihapus & sync', 'ok');
+    });
   };
   $('f_save').onclick = async () => {
+    if (state.readOnly || state.offlineMode) return;
     const auth = $('seg_key').classList.contains('on') ? 'key' : 'password';
     const nh = {
       id: h.id,
@@ -495,8 +705,15 @@ function hostModal(existing){
     if (auth === 'password') nh.password = $('f_pass').value;
     else { nh.privateKey = $('f_key').value.trim(); nh.keyPass = $('f_keypass').value; }
     if (!nh.host || !nh.user) { toast('host & username wajib diisi', 'err'); return; }
+    const prev = state.hosts.get(nh.id);
     state.hosts.set(nh.id, nh);
-    await pushItem(nh.id, nh);
+    const ok = await pushItem(nh.id, nh);
+    if (!ok) {
+      if (prev) state.hosts.set(nh.id, prev);
+      else state.hosts.delete(nh.id);
+      renderHosts();
+      return;
+    }
     renderHosts(); closeModal();
     toast('tersimpan & tersinkron', 'ok');
   };

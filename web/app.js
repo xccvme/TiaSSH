@@ -30,6 +30,10 @@ const state = {
   activeTab: 'welcome'
 };
 
+const nativeTransport = window.tiasshNativeTransport;
+const hasNativeTransport = !!(nativeTransport && nativeTransport.available && typeof nativeTransport.send === 'function');
+if (hasNativeTransport) nativeTransport.onEvent(m => onWsMessage({ data: JSON.stringify(m) }));
+
 // ---------- crypto (zero-knowledge, pure JS — works over http, byte-identical across devices) ----------
 // Scheme: PBKDF2-SHA256(password, serverSalt, 100000) -> 64 bytes = encKey(32) | macKey(32)
 //         item = iv(16) | AES-256-CBC(pkcs7(json)) | HMAC-SHA256(iv|ct, macKey)  [encrypt-then-MAC]
@@ -220,11 +224,24 @@ function setOfflineMode(on){
 function scheduleLeaseExpiry(){
   clearTimeout(state.leaseTimer);
   if (!leaseValid()) return;
-  state.leaseTimer = setTimeout(() => logoutSession('Lease berakhir. Login online diperlukan.'),
-    Math.min(state.expiresAt, state.issuedAt + LOCAL_LEASE_MS) - Date.now());
+  const ms = Math.min(state.expiresAt, state.issuedAt + LOCAL_LEASE_MS) - Date.now();
+  if (ms <= 0) { logoutSession('Lease berakhir. Login online diperlukan.'); return; }
+  state.leaseTimer = setTimeout(() => logoutSession('Lease berakhir. Login online diperlukan.'), ms);
+}
+function enforceLeaseValidity(now = Date.now()){
+  if (!state.token) return true;
+  if (!leaseValid(state, now)) {
+    logoutSession('Lease berakhir. Login online diperlukan.');
+    return false;
+  }
+  state.leaseSeenAt = now;
+  saveSession();
+  scheduleLeaseExpiry();
+  return true;
 }
 function logoutSession(message){
   state.wsStopped = true;
+  if (hasNativeTransport) nativeTransport.closeAll().catch(() => {});
   clearTimeout(state.wsRetryTimer); clearTimeout(state.recoveryTimer); clearTimeout(state.leaseTimer);
   if (state.ws) { const ws = state.ws; state.ws = null; ws.close(); }
   state.token = null; state.key = null; state.legacyKey = null; state.unlockRequired = false;
@@ -244,6 +261,7 @@ function scheduleRecovery(){
 async function recoverOnlineIfPossible(){
   if (!state.offlineMode || state.recovering) return false;
   if (state.token && !leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
+  const tokenAtStart = state.token;
   state.recovering = true;
   try {
     const me = await api('/api/me');
@@ -251,8 +269,12 @@ async function recoverOnlineIfPossible(){
     applyLease(me);
     if (!leaseValid()) { logoutSession('Lease berakhir. Login online diperlukan.'); return false; }
     saveSession(); scheduleLeaseExpiry();
-    setOfflineMode(false);
-    if (state.key) { await pullLatest(); state.wsStopped = false; openWs(); }
+    if (state.key) await pullSnapshot(true, tokenAtStart);
+    if (state.token !== tokenAtStart || !state.token) return false;
+    state.offlineMode = false; state.readOnly = false;
+    $('addHostBtn').disabled = false;
+    $('offlineBanner').classList.add('hidden');
+    if (state.key) { state.wsStopped = false; openWs(); }
     return true;
   } catch(e) {
     if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
@@ -260,7 +282,15 @@ async function recoverOnlineIfPossible(){
     return false;
   } finally { state.recovering = false; }
 }
-window.addEventListener('online', () => recoverOnlineIfPossible());
+if (window && typeof window.addEventListener === 'function') {
+  window.addEventListener('online', () => recoverOnlineIfPossible());
+  window.addEventListener('focus', () => enforceLeaseValidity());
+}
+if (document && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') enforceLeaseValidity();
+  });
+}
 
 // ---------- session persistence ----------
 function saveSession(){
@@ -370,6 +400,12 @@ async function unlockVault(passphrase){
 async function tryAutoLogin(){
   const s = loadSession();
   if (!s) return false;
+  const configuredServer = (localStorage.getItem('tiassh_server') || '').replace(/\/+$/,'');
+  const sessionServer = String(s.server || '').replace(/\/+$/,'');
+  if (configuredServer && sessionServer && configuredServer !== sessionServer) {
+    logoutSession('Endpoint berubah. Login online diperlukan.');
+    return false;
+  }
   // Sanitize sessions saved by older clients before making any request.
   localStorage.setItem('tiassh_server', s.server || '');
   state.token = s.token; state.email = s.email; state.salt = s.salt;
@@ -413,6 +449,13 @@ function enterApp(){
 // ---------- SYNC (zero-knowledge) ----------
 function openWs(){
   if (!state.token || state.wsStopped || state.offlineMode) return;
+  if (hasNativeTransport && !leaseValid()) return;
+  if (hasNativeTransport) {
+    state.wsRetries = 0;
+    setSync(true);
+    state.tabs.forEach(rec => { connectSsh(rec); if (rec.view === 'sftp') ensureSftp(rec); });
+    return;
+  }
   if (state.ws && state.ws.readyState < 2) return;
   const ws = new WebSocket(`${wsBase()}/ws?token=${encodeURIComponent(state.token)}`);
   ws.onmessage = onWsMessage;
@@ -439,11 +482,21 @@ function setSync(on){
   $('syncText').textContent = on ? 'sync aktif' : 'reconnect…';
   $('userStatus').textContent = on ? 'terhubung · terenkripsi' : 'tersinkron terakhir tersimpan';
 }
-function wsSend(obj){ if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj)); }
+function wsSend(obj){
+  const isRemote = /^(ssh|sftp)-/.test(obj.type);
+  if (isRemote && (!state.token || state.wsStopped || (hasNativeTransport && !leaseValid()))) return;
+  if (!hasNativeTransport && isRemote && state.offlineMode) return;
+  if (hasNativeTransport && isRemote) {
+    nativeTransport.send(obj).catch(e => onWsMessage({ data: JSON.stringify({ type: obj.type.startsWith('sftp-') ? 'sftp-error' : 'ssh-error', data: { _tag: obj.data._tag, error: String(e.message || e) } }) }));
+    return;
+  }
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+}
 
-async function pullSnapshot(){
-  if (state.offlineMode) return;
+async function pullSnapshot(force = false, tokenAtStart = state.token){
+  if (state.offlineMode && !force) return;
   const j = await api('/api/sync/snapshot');
+  if (tokenAtStart && (!state.token || state.token !== tokenAtStart)) return;
   return applySnapshot(j, true);
 }
 async function applySnapshot(j, online){
@@ -501,7 +554,12 @@ async function pushItem(key, value){
     if (enc === null) state.encryptedItems.delete(key);
     else state.encryptedItems.set(key, { category: 'host', key, value: enc, rev: 1 });
     saveSnapshotCache([...state.encryptedItems.values()], state.lastSync);
-  } catch(e) { toast('gagal simpan: ' + e.message, 'err'); }
+    return true;
+  } catch(e) {
+    if (e.status === 401 || e.status === 403) logoutSession('Sesi ditolak. Login online diperlukan.');
+    else toast('gagal simpan: ' + e.message, 'err');
+    return false;
+  }
 }
 
 // ---------- WS message router ----------
@@ -621,10 +679,17 @@ function hostModal(existing){
   $('f_cancel').onclick = closeModal;
   if (existing) $('f_del').onclick = () => {
     if (state.readOnly || state.offlineMode) return;
+    const prev = state.hosts.get(h.id);
     state.hosts.delete(h.id);
-    pushItem(h.id, null);
-    renderHosts(); closeModal();
-    toast('host dihapus & sync', 'ok');
+    pushItem(h.id, null).then(ok => {
+      if (!ok) {
+        if (prev) state.hosts.set(h.id, prev);
+        renderHosts();
+        return;
+      }
+      renderHosts(); closeModal();
+      toast('host dihapus & sync', 'ok');
+    });
   };
   $('f_save').onclick = async () => {
     if (state.readOnly || state.offlineMode) return;
@@ -640,8 +705,15 @@ function hostModal(existing){
     if (auth === 'password') nh.password = $('f_pass').value;
     else { nh.privateKey = $('f_key').value.trim(); nh.keyPass = $('f_keypass').value; }
     if (!nh.host || !nh.user) { toast('host & username wajib diisi', 'err'); return; }
+    const prev = state.hosts.get(nh.id);
     state.hosts.set(nh.id, nh);
-    await pushItem(nh.id, nh);
+    const ok = await pushItem(nh.id, nh);
+    if (!ok) {
+      if (prev) state.hosts.set(nh.id, prev);
+      else state.hosts.delete(nh.id);
+      renderHosts();
+      return;
+    }
     renderHosts(); closeModal();
     toast('tersimpan & tersinkron', 'ok');
   };

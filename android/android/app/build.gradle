@@ -22,6 +22,11 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/versions/*/OSGI-INF/MANIFEST.MF']
+        }
+    }
 }
 
 repositories {
@@ -36,6 +41,9 @@ dependencies {
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
+    implementation 'com.github.mwiede:jsch:2.28.8'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.80'
+    testImplementation 'org.json:json:20240303'
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
