@@ -52,7 +52,7 @@ function renderer(native = true, ipc = new EventEmitter()) {
 
 test('desktop offline shell and SFTP use native transport; WS recovery does not replace them', () => {
   const c = renderer();
-  c.run("state.token='t'; state.issuedAt=Date.now()-1000; state.expiresAt=Date.now()+100000; state.offlineMode=true; globalThis.output=[]; globalThis.rec={id:'x',host:{host:'host',user:'user'},term:{cols:80,rows:24,write(s){output.push(s);}},view:'sftp',sftp:{opened:false},sftpDiv:document.createElement('div')};state.tabs.set('x',rec);connectSsh(rec);ensureSftp(rec);");
+  c.run("state.token='t'; state.issuedAt=Date.now()-1000; state.expiresAt=Date.now()+100000; state.offlineMode=true; state.nativeTransportActive=true; globalThis.output=[]; globalThis.rec={id:'x',host:{host:'host',user:'user'},term:{cols:80,rows:24,write(s){output.push(s);}},view:'sftp',sftp:{opened:false},sftpDiv:document.createElement('div')};state.tabs.set('x',rec);connectSsh(rec);ensureSftp(rec);");
   assert.deepEqual(c.sent.map(m=>m.type), ['ssh-open','sftp-open']);
   assert.deepEqual(c.sent.map(m=>m.data._tag), ['x','sf:x']);
   c.emit({type:'ssh-data',data:{_tag:'x',data:'YQ=='}});
@@ -158,12 +158,12 @@ function mainBridge() {
 
 test('shared logout through actual preload and main immediately closes SSH and SFTP and permits login again', () => {
   const bridge = mainBridge(), c = renderer(true, bridge.ipc);
-  c.run("state.token='t';state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;wsSend({type:'ssh-open',data:{_tag:'x',host:'h',username:'u'}});wsSend({type:'sftp-open',data:{_tag:'sf:x',host:'h',username:'u'}});");
+  c.run("state.token='t';state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;state.nativeTransportActive=true;wsSend({type:'ssh-open',data:{_tag:'x',host:'h',username:'u'}});wsSend({type:'sftp-open',data:{_tag:'sf:x',host:'h',username:'u'}});");
   assert.equal(bridge.clients.length, 2);
   assert.doesNotThrow(() => c.run('logoutSession()'));
   assert.ok(bridge.clients.every(client => client.ended));
   assert.equal(c.run('state.token'), null);
-  c.run("state.token='new';state.wsStopped=false;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;wsSend({type:'ssh-open',data:{_tag:'new',host:'h',username:'u'}});");
+  c.run("state.token='new';state.wsStopped=false;state.nativeTransportActive=true;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;wsSend({type:'ssh-open',data:{_tag:'new',host:'h',username:'u'}});");
   assert.equal(bridge.clients.length, 3);
   assert.equal(bridge.clients[2].ended, undefined);
   bridge.win.emit('closed');
@@ -172,15 +172,15 @@ test('shared logout through actual preload and main immediately closes SSH and S
 test('native SSH and SFTP sends require token, running session, and valid lease even offline', () => {
   const c = renderer();
   for (const stateSetup of [
-    "state.token=null;state.wsStopped=false;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;",
-    "state.token='t';state.wsStopped=true;",
-    "state.token='t';state.wsStopped=false;state.expiresAt=Date.now()-1;",
-    "state.token='t';state.wsStopped=false;state.issuedAt=null;state.expiresAt=null;"
+    "state.token=null;state.wsStopped=false;state.nativeTransportActive=true;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;",
+    "state.token='t';state.wsStopped=true;state.nativeTransportActive=true;",
+    "state.token='t';state.wsStopped=false;state.nativeTransportActive=true;state.expiresAt=Date.now()-1;",
+    "state.token='t';state.wsStopped=false;state.nativeTransportActive=true;state.issuedAt=null;state.expiresAt=null;"
   ]) {
     c.run(stateSetup + "wsSend({type:'ssh-open',data:{_tag:'x'}});wsSend({type:'sftp-op',data:{_tag:'sf:x'}});");
     assert.equal(c.sent.length, 0, stateSetup);
   }
-  c.run("state.token='t';state.wsStopped=false;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;state.offlineMode=true;wsSend({type:'ssh-input',data:{_tag:'x'}});");
+  c.run("state.token='t';state.wsStopped=false;state.nativeTransportActive=true;state.issuedAt=Date.now()-1000;state.expiresAt=Date.now()+100000;state.offlineMode=true;wsSend({type:'ssh-input',data:{_tag:'x'}});");
   assert.equal(c.sent.length, 1);
   c.run('logoutSession()');
   c.run("wsSend({type:'ssh-open',data:{_tag:'new'}});wsSend({type:'sftp-open',data:{_tag:'sf:new'}});");

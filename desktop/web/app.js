@@ -27,7 +27,7 @@ const state = {
   unlockRequired: false, issuedAt: null, expiresAt: null, leaseSeenAt: null,
   readOnly: false, offlineMode: false, encryptedItems: new Map(),
   hosts: new Map(), lastSync: 0, ws: null, tabs: new Map(),
-  activeTab: 'welcome'
+  activeTab: 'welcome', nativeTransportActive: false, wsStopped: false
 };
 
 const nativeTransport = window.tiasshNativeTransport;
@@ -452,6 +452,7 @@ function openWs(){
   if (hasNativeTransport && !leaseValid()) return;
   if (hasNativeTransport) {
     state.wsRetries = 0;
+    state.nativeTransportActive = true;
     setSync(true);
     state.tabs.forEach(rec => { connectSsh(rec); if (rec.view === 'sftp') ensureSftp(rec); });
     return;
@@ -486,8 +487,14 @@ function wsSend(obj){
   const isRemote = /^(ssh|sftp)-/.test(obj.type);
   if (isRemote && (!state.token || state.wsStopped || (hasNativeTransport && !leaseValid()))) return;
   if (!hasNativeTransport && isRemote && state.offlineMode) return;
-  if (hasNativeTransport && isRemote) {
-    nativeTransport.send(obj).catch(e => onWsMessage({ data: JSON.stringify({ type: obj.type.startsWith('sftp-') ? 'sftp-error' : 'ssh-error', data: { _tag: obj.data._tag, error: String(e.message || e) } }) }));
+  if (hasNativeTransport && isRemote && state.nativeTransportActive) {
+    nativeTransport.send(obj).catch(e => {
+      console.error('Native transport error:', e);
+      // Fallback ke WebSocket proxy saat native transport gagal
+      state.nativeTransportActive = false;
+      toast('Native transport gagal, fallback ke WebSocket proxy…', 'warn');
+      setTimeout(() => openWs(), 100);
+    });
     return;
   }
   if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
@@ -658,6 +665,11 @@ function hostModal(existing){
     </div>
     <div id="keyBox" class="${h.auth === 'key' ? '' : 'hidden'}">
       <label>Private Key (PEM — OpenSSH/RSA/Ed25519)</label>
+      <div style="display:flex;gap:8px;margin-bottom:4px">
+        <input type="file" id="f_keyfile" accept=".pem,.key,.ppk,*" style="display:none">
+        <button type="button" id="loadKeyBtn" style="flex:0 0 auto;padding:4px 12px;font-size:0.9em">📂 Load dari File</button>
+        <span id="keyFileName" style="color:#888;font-size:0.9em;line-height:32px"></span>
+      </div>
       <textarea id="f_key" class="mono" rows="6" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----">${esc(h.privateKey || '')}</textarea>
       <label>Passphrase (opsional, jika key proteksi)</label>
       <input id="f_keypass" type="password" value="${esc(h.keyPass || '')}">
@@ -677,6 +689,22 @@ function hostModal(existing){
   $('seg_pw').onclick = () => setSeg('password');
   $('seg_key').onclick = () => setSeg('key');
   $('f_cancel').onclick = closeModal;
+  
+  // Load key dari file
+  $('loadKeyBtn').onclick = () => $('f_keyfile').click();
+  $('f_keyfile').onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      $('f_key').value = ev.target.result;
+      $('keyFileName').textContent = file.name;
+      toast(`Key loaded: ${file.name}`, 'ok');
+    };
+    reader.onerror = () => toast('Gagal membaca file', 'err');
+    reader.readAsText(file);
+  };
+  
   if (existing) $('f_del').onclick = () => {
     if (state.readOnly || state.offlineMode) return;
     const prev = state.hosts.get(h.id);
@@ -755,6 +783,27 @@ function openTab(host){
   sftpDiv.parentNode.insertBefore(vs, sftpDiv.nextSibling);
   rec.viewSwitch = vs;
   vs.querySelectorAll('button').forEach(b => b.onclick = () => setView(rec, b.dataset.v));
+  
+  // Clipboard support (copy/paste)
+  term.attachCustomKeyEventHandler(ev => {
+    if (ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
+      document.execCommand('copy');
+      return false;
+    }
+    if (ev.ctrlKey && ev.key === 'v') {
+      navigator.clipboard.readText().then(text => term.paste(text)).catch(() => {});
+      return false;
+    }
+    return true;
+  });
+  
+  // Selection → clipboard
+  term.onSelectionChange(() => {
+    const sel = term.getSelection();
+    if (sel && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sel).catch(() => {});
+    }
+  });
 
   activateTab(host.id);
   connectSsh(rec);
@@ -798,12 +847,10 @@ function setView(rec, v){
   if (v === 'term') {
     rec.termDiv.style.display = '';
     rec.sftpDiv.style.display = 'none';
-    rec.viewSwitch.style.display = 'none';
     rec.fit.fit(); rec.term.focus();
   } else {
     rec.termDiv.style.display = 'none';
     rec.sftpDiv.style.display = '';
-    rec.viewSwitch.style.display = '';
     ensureSftp(rec);
   }
 }
@@ -815,8 +862,9 @@ function activateTab(id){
   $('welcome').style.display = show ? 'none' : '';
   state.tabs.forEach((r, rid) => {
     const vis = String(rid) === String(id);
-    if (r.view === 'term') r.termDiv.style.display = vis ? '' : 'none';
-    else { r.sftpDiv.style.display = vis ? '' : 'none'; r.viewSwitch.style.display = vis ? '' : 'none'; }
+    r.termDiv.style.display = (vis && r.view === 'term') ? '' : 'none';
+    r.sftpDiv.style.display = (vis && r.view === 'sftp') ? '' : 'none';
+    r.viewSwitch.style.display = vis ? '' : 'none';
   });
   const r = state.tabs.get(id);
   if (r && r.view === 'term') { r.fit.fit(); r.term.focus(); }
