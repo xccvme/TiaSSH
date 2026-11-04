@@ -1123,6 +1123,10 @@ routeMsg = function(rec, m){
 
 // ---------- boot ----------
 (async function boot(){
+  // Auto-fill server URL dari cache saat pertama kali load
+  const cachedServer = localStorage.getItem('tiassh_server') || '';
+  if (cachedServer && $('authServer')) $('authServer').value = cachedServer;
+  
   const ok = await tryAutoLogin();
   if (!ok) $('auth').classList.remove('hidden');
 })();
