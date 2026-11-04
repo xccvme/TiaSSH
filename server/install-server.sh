@@ -55,12 +55,18 @@ if [[ -z "${WEB_ORIGIN:-}" ]]; then
   WEB_ORIGIN="$PUBLIC_URL"
 fi
 
+# Portal web (registrasi/management akun) bisa ditutup operator:
+# WEB_PORTAL_ENABLED=1 (default, buka) atau 0 (tutup -> surface web 404,
+# endpoint native tetap hidup & tervalidasi).
+WEB_PORTAL_ENABLED="${WEB_PORTAL_ENABLED:-1}"
+
 contains_newline "$PUBLIC_URL" && fail "PUBLIC_URL mengandung newline tidak aman."
 contains_newline "$WEB_ORIGIN" && fail "WEB_ORIGIN mengandung newline tidak aman."
 [[ "$HEALTH_RETRIES" =~ ^[1-9][0-9]*$ ]] || fail "HEALTH_RETRIES harus positif."
 [[ "$HEALTH_DELAY_SEC" =~ ^[0-9]+$ ]] || fail "HEALTH_DELAY_SEC harus angka."
 [[ "$PUBLIC_URL" =~ ^https?://[^[:space:]\"\\]+$ ]] || fail "PUBLIC_URL harus http/https tanpa karakter kontrol."
 [[ "$WEB_ORIGIN" =~ ^https?://[^[:space:]\"\\]+$ ]] || fail "WEB_ORIGIN harus http/https tanpa karakter kontrol."
+[[ "$WEB_PORTAL_ENABLED" =~ ^[01]$ ]] || fail "WEB_PORTAL_ENABLED harus 0 (tutup) atau 1 (buka)."
 
 node -e '
 const [pub, web] = process.argv.slice(1);
@@ -180,6 +186,7 @@ Environment=NODE_ENV=production
 Environment=PORT=$PORT
 Environment=PUBLIC_URL=$PUBLIC_URL
 Environment=WEB_ORIGIN=$WEB_ORIGIN
+Environment=WEB_PORTAL_ENABLED=$WEB_PORTAL_ENABLED
 
 [Install]
 WantedBy=multi-user.target

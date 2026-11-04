@@ -76,7 +76,9 @@ label{font-size:12px;color:var(--muted);display:block;margin:12px 0 5px;font-wei
 .tab .t-ico{font-size:14px}
 .tab .t-x{opacity:.5;font-size:12px;padding:2px 5px;border-radius:4px}
 .tab .t-x:hover{opacity:1;background:var(--panel3)}
-#menuBtn{display:none;padding:8px 12px;background:transparent;color:var(--text);font-size:16px;flex-shrink:0}
+#menuBtn{padding:8px 12px;background:transparent;color:var(--text);font-size:16px;flex-shrink:0;border-radius:8px}
+#menuBtn:hover{background:var(--panel3)}
+#app.sb-hidden #sidebar{display:none}
 .tab .badge-conn{width:7px;height:7px;border-radius:50%;background:var(--green)}
 .tab .badge-conn.err{background:var(--red)}
 .tab .badge-conn.off{background:var(--dim)}
@@ -168,7 +170,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
     <div class="auth-actions">
       <button class="btn" id="authLoginBtn">Masuk</button>
     </div>
-    <div class="auth-note">Pendaftaran akun dilakukan di portal web: buka <b>/api/web/register</b> dari browser desktop/mobile lalu kembali login di aplikasi ini.</div>
+    <div class="auth-note" id="authSignupNote">Pendaftaran akun dilakukan di portal web: buka <b>/api/web/register</b> dari browser desktop/mobile lalu kembali login di aplikasi ini.</div>
     <div class="auth-note">🔒 Passphrase vault hanya dipakai lokal untuk enkripsi/dekripsi dan <b>tidak pernah</b> dikirim ke server. Setelah restart, vault harus dibuka ulang.</div>
   </div>
 </div>
@@ -181,6 +183,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
       <div style="display:flex;gap:4px">
         <button class="btn ghost small" id="addHostBtn" title="Tambah host">+ Host</button>
         <button class="btn icon" id="logoutBtn" title="Keluar">⏻</button>
+        <button class="btn icon" id="sbCollapseBtn" title="Sembunyikan daftar host">◀</button>
       </div>
     </div>
     <div class="sb-search"><input id="hostSearch" placeholder="Cari host..." autocomplete="off"></div>
@@ -195,7 +198,7 @@ textarea.mono{font-family:Consolas,monospace;font-size:12px;resize:vertical}
   </div>
   <div id="main">
     <div id="tabsBar">
-      <button id="menuBtn">☰</button>
+      <button id="menuBtn" title="Tampilkan daftar host">☰</button>
       <div class="tab active" data-tab="welcome"><span class="t-ico">🏠</span>Welcome</div>
     </div>
     <div id="termWrap">

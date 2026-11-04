@@ -54,6 +54,10 @@ const WEB_ORIGIN = process.env.WEB_ORIGIN || PUBLIC_URL;
 const NATIVE_ORIGINS = new Set(String(process.env.NATIVE_ORIGINS || 'tauri://localhost,http://tauri.localhost,null,https://localhost,http://localhost').split(',').map(v => v.trim()).filter(Boolean));
 const SESSION_TTL_SEC = Math.max(300, parseInt(process.env.SESSION_TTL_SEC || '3600', 10));
 const CLIENT_SESSION_TTL_SEC = Math.min(129600, Math.max(1, parseInt(process.env.CLIENT_SESSION_TTL_SEC || '129600', 10)));
+// Portal web (registrasi + management akun) bisa ditutup operator untuk keamanan.
+// Menutup portal TIDAK mematikan endpoint native (login/sync/ws) dan tidak
+// melonggarkan validasi apa pun — hanya permukaan HTTP web yang dihilangkan.
+const WEB_PORTAL_ENABLED = String(process.env.WEB_PORTAL_ENABLED ?? '1') !== '0';
 const security = require('./account-security');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -153,15 +157,22 @@ app.use((req, res, next) => {
   next();
 });
 const PORTAL_DIR = path.join(__dirname, 'web', 'portal');
-app.use('/web', express.static(PORTAL_DIR));
-app.get('/', (req, res) => {
+// Portal tertutup -> seluruh aset/route web hilang dari permukaan publik.
+function requirePortal(req, res, next) {
+  if (!WEB_PORTAL_ENABLED) return res.status(404).json({ error: 'portal web ditutup' });
+  next();
+}
+app.use('/web', requirePortal, express.static(PORTAL_DIR));
+app.get('/', requirePortal, (req, res) => {
   const portalIndex = path.join(PORTAL_DIR, 'index.html');
   if (fs.existsSync(portalIndex)) return res.sendFile(portalIndex);
   res.status(503).json({ error: 'portal belum terpasang' });
 });
 app.get('/api/health', (req, res) => res.json({ ok: true, name: 'tiassh-sync', version: '1.0.0' }));
+// Status non-sensitif supaya klien native bisa memberi tahu kalau pendaftaran ditutup.
+app.get('/api/config', (req, res) => res.json({ portalEnabled: WEB_PORTAL_ENABLED, clientSessionTtlSec: CLIENT_SESSION_TTL_SEC }));
 
-security.installWebRoutes(app, db, { webOrigin: new URL(WEB_ORIGIN).origin, sessionTtlSec: SESSION_TTL_SEC });
+security.installWebRoutes(app, db, { webOrigin: new URL(WEB_ORIGIN).origin, sessionTtlSec: SESSION_TTL_SEC, portalEnabled: WEB_PORTAL_ENABLED });
 app.post('/api/register', (req, res) => res.status(404).json({ error: 'Pendaftaran hanya melalui portal web' }));
 
 // login

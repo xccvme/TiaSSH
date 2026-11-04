@@ -75,9 +75,22 @@ test('logout stops reconnect loop and clears ws retry timer',()=>{
   const c=client();
   c.run("state.token='t'; openWs(); state.ws.onclose({code:1006});");
   assert.equal(c.timers.size,1);
+  // Logout manual kini lewat dialog konfirmasi (anti klik-tak-sengaja).
   c.run("$('logoutBtn').onclick()");
+  assert.equal(c.timers.size,1); // belum keluar sebelum dikonfirmasi
+  c.run("$('cxOk').onclick()");
   assert.equal(c.timers.size,0);
   assert.equal(c.run('state.wsStopped'),true);
+});
+
+test('logout confirm cancel does not log out',()=>{
+  const c=client();
+  c.run("state.token='t'; openWs(); state.ws.onclose({code:1006});");
+  assert.equal(c.timers.size,1);
+  c.run("$('logoutBtn').onclick()");
+  c.run("$('cxCancel').onclick()");
+  assert.equal(c.timers.size,1); // batal -> sesi & retry timer tetap ada
+  assert.equal(c.run('state.wsStopped'),false);
 });
 
 test('offline mode toggles host-write button disabled state',()=>{

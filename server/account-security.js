@@ -203,6 +203,14 @@ function verifyPassword(user, password) {
 function installWebRoutes(app, db, opts = {}) {
   const webOrigin = opts.webOrigin;
   const sessionTtlSec = opts.sessionTtlSec || 3600;
+  // Portal bisa ditutup operator. Saat tertutup semua route web balas 404,
+  // sehingga permukaan serangan web hilang tanpa mengubah jalur native.
+  const portalEnabled = opts.portalEnabled !== false;
+
+  function requirePortal(req, res, next) {
+    if (!portalEnabled) return res.status(404).json({ error: 'portal web ditutup' });
+    next();
+  }
 
   const emailOK = (email) => typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   const passwordOK = (password) => typeof password === 'string' && password.length >= 12 && Buffer.byteLength(password) <= 72;
@@ -243,7 +251,7 @@ function installWebRoutes(app, db, opts = {}) {
     return counter;
   }
 
-  app.post('/api/web/register', requireWebOrigin, (req, res) => {
+  app.post('/api/web/register', requirePortal, requireWebOrigin, (req, res) => {
     const { email, password } = req.body || {};
     const normalized = String(email || '').toLowerCase();
     if (!emailOK(normalized) || !passwordOK(password)) {
@@ -257,7 +265,7 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json(newEnrollment(db, { email: normalized, passHash, salt, kind: 'register' }));
   });
 
-  app.post('/api/web/enroll/confirm', requireWebOrigin, (req, res) => {
+  app.post('/api/web/enroll/confirm', requirePortal, requireWebOrigin, (req, res) => {
     const { challenge, otp } = req.body || {};
     const consumed = consumeEnrollment(db, challenge, otp);
     if (!consumed.ok) return res.status(401).json({ error: 'tantangan/otp tidak valid' });
@@ -281,7 +289,7 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json({ ok: true });
   });
 
-  app.post('/api/web/login', requireWebOrigin, (req, res) => {
+  app.post('/api/web/login', requirePortal, requireWebOrigin, (req, res) => {
     const { email, password, otp } = req.body || {};
     const normalized = String(email || '').toLowerCase();
     const user = db.prepare('SELECT id,email,pass_hash,salt,totp_secret,last_otp,auth_revision,display_name FROM users WHERE email=?').get(normalized);
@@ -313,9 +321,9 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json({ ok: true, email: user.email, authRevision: user.auth_revision, displayName: user.display_name || '' });
   });
 
-  app.get('/api/web/me', webAuth, (req,res) => res.json({ email:req.webSession.email, displayName:req.webSession.displayName, authRevision:req.webSession.authRevision, totpEnabled:true }));
+  app.get('/api/web/me', requirePortal, webAuth, (req,res) => res.json({ email:req.webSession.email, displayName:req.webSession.displayName, authRevision:req.webSession.authRevision, totpEnabled:true }));
 
-  app.post('/api/web/profile', requireWebOrigin, webAuth, (req, res) => {
+  app.post('/api/web/profile', requirePortal, requireWebOrigin, webAuth, (req, res) => {
     const counter = requirePasswordAndOtp(req, res);
     if (counter === null) return;
     const displayName = String(req.body?.displayName || '').trim().slice(0, 80);
@@ -325,7 +333,7 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json({ ok: true, displayName });
   });
 
-  app.post('/api/web/password', requireWebOrigin, webAuth, (req, res) => {
+  app.post('/api/web/password', requirePortal, requireWebOrigin, webAuth, (req, res) => {
     const counter = requirePasswordAndOtp(req, res);
     if (counter === null) return;
     const { newPassword } = req.body || {};
@@ -342,7 +350,7 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json({ ok: true });
   });
 
-  app.post('/api/web/totp/reset', requireWebOrigin, webAuth, (req, res) => {
+  app.post('/api/web/totp/reset', requirePortal, requireWebOrigin, webAuth, (req, res) => {
     const counter = requirePasswordAndOtp(req, res);
     if (counter === null) return;
     db.prepare('UPDATE users SET last_otp=? WHERE id=?').run(counter, req.webSession.id);
@@ -356,7 +364,7 @@ function installWebRoutes(app, db, opts = {}) {
     return res.json({ ok: true, ...enroll });
   });
 
-  app.post('/api/web/logout', requireWebOrigin, webAuth, (req, res) => {
+  app.post('/api/web/logout', requirePortal, requireWebOrigin, webAuth, (req, res) => {
     db.prepare('UPDATE sessions SET revoked=1 WHERE token=?').run(req.webSession.token);
     res.setHeader('Set-Cookie', 'tiassh_web=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
     return res.json({ ok: true });

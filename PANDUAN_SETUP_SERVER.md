@@ -320,6 +320,7 @@ Untuk **update akun lama** dengan key belum diinisialisasi, cara aman yang disar
 | `PORT` | `8080`, angka 1–65535 |
 | `PUBLIC_URL` | URL publik; jika kosong menggunakan IP pertama `hostname -I` (atau loopback jika tidak tersedia) + port. Fallback **tidak menjamin IP publik/reachable**; tetapkan domain sendiri. |
 | `WEB_ORIGIN` | Default `PUBLIC_URL`; origin portal `scheme://host[:port]`, tanpa path/query/fragment. Harus sama dengan origin yang dibuka browser. |
+| `WEB_PORTAL_ENABLED` | `1` (buka, default) atau `0` (tutup). `0` menghilangkan seluruh permukaan web — halaman portal, aset `/web/*`, dan semua route `/api/web/*` membalas 404 — demi permukaan serangan lebih kecil. Endpoint native (`/api/login`, `/api/sync/*`, `/ws`) **tetap hidup & tervalidasi** dan tidak dilonggarkan. |
 | `HEALTH_RETRIES` | `15`; jumlah pemeriksaan |
 | `HEALTH_DELAY_SEC` | `1`; jeda pemeriksaan |
 
@@ -335,6 +336,27 @@ sudo systemctl restart tiassh
 ```
 
 Pastikan drop-in lama tidak menimpa URL/port baru. Jangan memakai URL loopback VPS di HP.
+
+### Menutup / membuka portal web
+
+Portal web hanya dipakai untuk **pendaftaran akun & manajemen akun** (register, login web, ganti password, display name). Setelah semua akun Anda ada, portal bisa ditutup untuk keamanan:
+
+```bash
+# Tutup portal web (permukaan web hilang, endpoint native tetap aman):
+cd /opt/tiassh/server
+sudo env APP_DIR=/opt/tiassh PORT=8080 \
+  PUBLIC_URL=https://ssh.example.com \
+  WEB_ORIGIN=https://ssh.example.com \
+  WEB_PORTAL_ENABLED=0 \
+  bash install-server.sh
+```
+
+Efek `WEB_PORTAL_ENABLED=0`:
+- `GET /`, `GET /web/*`, `POST /api/web/register|login|profile|password|...` → **404** (route tidak ada).
+- `GET /api/config` tetap membalas `{ "portalEnabled": false, ... }` (non-sensitif) supaya klien native bisa menampilkan "pendaftaran ditutup oleh operator".
+- Endpoint native `POST /api/login`, `GET /api/sync/*`, `GET /api/me`, dan WebSocket `/ws` **tetap berfungsi normal** dengan validasi token/origin sama persis. Tidak ada jalur baru, tidak ada pelonggaran.
+
+Untuk membuka kembali, jalankan installer dengan `WEB_PORTAL_ENABLED=1` (atau tanpa flag, karena defaultnya 1).
 
 ## 4. HTTPS reverse proxy (Nginx)
 

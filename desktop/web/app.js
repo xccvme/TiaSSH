@@ -350,6 +350,14 @@ async function doLogin(){
     localStorage.setItem('tiassh_server', srv);
     const email = $('authEmail').value.trim(), pass = $('authPass').value;
     if (!email || !pass) throw new Error('isi email & password');
+    // Portal web bisa ditutup operator; tampilkan di catatan kalau sudah ditutup.
+    try {
+      const cfgRes = await fetch(apiBase() + '/api/config');
+      const cfg = await cfgRes.json();
+      if (cfg && cfg.portalEnabled === false && $('authSignupNote')) {
+        $('authSignupNote').innerHTML = 'Pendaftaran/portal web sedang <b>ditutup</b> oleh operator. Hubungi admin untuk pembuatan akun.';
+      }
+    } catch(e) {}
     // Vault passphrase stays on this device; only account credentials go to login.
     const vaultPass = $('authVaultPass').value || pass;
     const j = await api('/api/login', { method: 'POST', body: JSON.stringify({ email, password: pass }) });
@@ -428,10 +436,23 @@ async function tryAutoLogin(){
   }
 }
 
-$('logoutBtn').onclick = () => {
-  logoutSession();
-  location.reload();
-};
+$('logoutBtn').onclick = () => confirmLogout();
+
+// Logout manual harus lewat konfirmasi supaya tidak terklik tidak sengaja.
+// Auto-logout (lease habis / sesi ditolak) tetap langsung tanpa dialog.
+function confirmLogout(){
+  const m = $('modal');
+  m.innerHTML = `
+    <h2>Keluar dari TiaSSH?</h2>
+    <div class="m-sub">Vault akan terkunci dan sesi perangkat ini berakhir. Host & kunci tetap tersimpan terenkripsi di server.</div>
+    <div class="actions">
+      <button class="btn ghost" id="cxCancel">Batal</button>
+      <button class="btn danger" id="cxOk">Ya, Keluar</button>
+    </div>`;
+  $('modalBg').classList.remove('hidden');
+  $('cxCancel').onclick = closeModal;
+  $('cxOk').onclick = () => { closeModal(); logoutSession(); location.reload(); };
+}
 
 // ---------- APP ----------
 function enterApp(){
@@ -750,6 +771,7 @@ function closeModal(){ $('modalBg').classList.add('hidden'); }
 
 // ---------- TABS ----------
 function openTab(host){
+  if (isMobile()) toggleSidebar(false);
   if (state.tabs.has(host.id)) { activateTab(host.id); return; }
   const term = new Terminal({
     fontFamily: 'Cascadia Code, Consolas, monospace', fontSize: 13,
@@ -884,7 +906,29 @@ function closeTab(id){
 function setConnText(t){ $('connText').textContent = t; }
 function resizeAll(){ state.tabs.forEach(r => { try { if (r.view === 'term') r.fit.fit(); } catch(e){} }); }
 
-$('menuBtn').onclick = () => $('sidebar').classList.toggle('open');
+// ---------- SIDEBAR (daftar host) toggle ----------
+// Mobile: sidebar overlay yang digeser masuk/keluar (.open).
+// Desktop: sidebar disembunyikan total (#app.sb-hidden) agar layar terminal lega.
+function isMobile(){
+  try { return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches); }
+  catch(e){ return false; }
+}
+function sidebarVisible(){
+  if (isMobile()) return $('sidebar').classList.contains('open');
+  return !$('app').classList.contains('sb-hidden');
+}
+function toggleSidebar(force){
+  const open = force === undefined ? !sidebarVisible() : !!force;
+  if (isMobile()) $('sidebar').classList.toggle('open', open);
+  else $('app').classList.toggle('sb-hidden', !open);
+  const b = $('menuBtn');
+  if (b) b.title = open ? 'Sembunyikan daftar host' : 'Tampilkan daftar host';
+  const c = $('sbCollapseBtn');
+  if (c) c.title = b ? b.title : c.title;
+  return open;
+}
+$('menuBtn').onclick = () => toggleSidebar();
+$('sbCollapseBtn').onclick = () => toggleSidebar(false);
 document.querySelector('.tab[data-tab="welcome"]').addEventListener('click', () => {
   state.activeTab = 'welcome';
   $('welcome').style.display = '';
@@ -1126,7 +1170,7 @@ routeMsg = function(rec, m){
   // Auto-fill server URL dari cache saat pertama kali load
   const cachedServer = localStorage.getItem('tiassh_server') || '';
   if (cachedServer && $('authServer')) $('authServer').value = cachedServer;
-  
+
   const ok = await tryAutoLogin();
   if (!ok) $('auth').classList.remove('hidden');
 })();
