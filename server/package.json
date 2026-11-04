@@ -1,6 +1,6 @@
 {
   "name": "tiassh-sync-server",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "private": true,
   "description": "TiaSSH - free self-hosted sync server for SSH client (Termius-like)",
   "license": "WTFPL",

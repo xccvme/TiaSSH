@@ -1,7 +1,7 @@
 {
   "name": "tiassh",
   "productName": "TiaSSH",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "description": "TiaSSH - Free self-hosted SSH client (Termius-like) - desktop",
   "main": "main.js",
   "dependencies": {
