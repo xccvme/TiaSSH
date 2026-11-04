@@ -34,14 +34,18 @@ Browser bukan klien terminal/vault. `web/` di root proyek adalah sumber **UI nat
 | `server/web/portal/portal.js` | Fetch `/api/web/*` memakai cookie, enrollment TOTP, rendering aman via textContent; tidak menyimpan bearer/host/private key di browser storage. |
 | `server/web/portal/portal.css` | Style portal terpisah sesuai CSP tanpa inline script/style. |
 | `web/index.html` | UI native login/unlock vault, host/keypair, terminal tabs, file manager. |
-| `web/app.js` | Login/sesi lokal; `deriveKey`, `deriveLegacyKey`, `encValue`/`decValue`; unlock/migrasi vault; snapshot/pull/push; `openWs`, pesan sinkronisasi, reconnect/backoff; `connectSsh`, `ensureSftp`, operasi file/upload/download. |
+| `web/app.js` | Login/sesi lokal; lease 36 jam (`leaseValid`, `applyLease`, `scheduleLeaseExpiry`); cache snapshot ciphertext offline + banner read-only; `deriveKey`, `deriveLegacyKey`, `encValue`/`decValue`; unlock/migrasi vault; snapshot/pull/push; `openWs`, pesan sinkronisasi, reconnect/backoff; `connectSsh`, `ensureSftp`, operasi file/upload/download; `wsSend` merutekan jalur native bila `hasNativeTransport`. |
+| `web/android-transport.js` | Adapter transport native Android: deteksi `Capacitor`, `registerPlugin('SshTransport')` dengan fallback `Capacitor.Plugins.SshTransport`, `ensureListener`, gating generasi pada `closeAll`, global `window.tiasshNativeTransport`. Tidak aktif di browser biasa. |
 | `web/vendor/*` | aes-js, js-sha256, xterm dan fit addon lokal; lisensi upstream tetap berlaku. |
-| `desktop/main.js` | Electron single-instance, BrowserWindow dengan contextIsolation/sandbox dan tanpa nodeIntegration; load `desktop/web/index.html`, membuka URL luar di browser sistem. |
+| `desktop/main.js` | Electron single-instance, BrowserWindow dengan contextIsolation/sandbox dan tanpa nodeIntegration; load `desktop/web/index.html`, membuka URL luar di browser sistem; handler IPC `native-transport:send` / `native-transport:close-all` dengan validasi sender/frame/URL. |
+| `desktop/preload.js` | `contextBridge` menyajikan `window.tiasshNativeTransport` (allowlist channel, `send`/`onEvent`/`closeAll`) tanpa membocorkan event IPC ke renderer. |
+| `desktop/transport.js` | Transport SSH/SFTP native memakai `ssh2`; TOFU SHA256 host-key pins (`ssh-host-pins.json`), routing tag, queueing sebelum ready, integritas chunk SFTP. |
 | `desktop/package.json` | Dependensi Electron/electron-builder; NSIS Windows x64 dan AppImage Linux; build output `desktop/dist/`. |
 | `desktop/web/` | Salinan UI native untuk packaging; harus disinkronkan dari root `web/` sebelum build. |
 | `android/capacitor.config.json`, `android/package.json` | Konfigurasi Capacitor, webDir `../web`, npm scripts sync/build. |
 | `android/android/app/src/main/AndroidManifest.xml` | Permission/konfigurasi activity Android; bukan logika auth server. |
 | `android/android/` | Project Gradle, Android Gradle Plugin 8.2.1, wrapper Gradle 8.2.1, SDK compile/target 34; sumber generated Capacitor dan aset. |
+| `android/android/app/src/main/java/com/tiassh/app/SshTransportPlugin.java` | Plugin Capacitor transport SSH/SFTP native (JSch): shell PTY + resize, operasi SFTP, TOFU host key, generation fence pada logout, validasi input. Didaftarkan manual di `MainActivity.onCreate`. |
 | `android/android/app/src/main/assets/public/` | Output hasil `cap sync android`, bukan sumber primer UI. |
 | `server/data/` saat runtime | `tiassh.db`, SQLite WAL/SHM, `master.key`, auth/sync runtime. Bukan isi distribusi. |
 | `server/tests/*.test.js` | Suite API/OTP/sesi/recovery/portal/UI/security dan regresi sync. |
@@ -66,12 +70,15 @@ Browser bukan klien terminal/vault. `web/` di root proyek adalah sumber **UI nat
 3. Host/keypair diserialisasi dan dienkripsi sebelum `pushItem` → `/api/sync/push`. SQLite menyimpan `value_enc`, bukan kredensial host plaintext sebagai item sync.
 4. Login/unlock menarik `/api/sync/snapshot`; pembaruan berikutnya `/api/sync/pull?since=...`. Revisi/cursor/tombstone mencegah kehilangan update/delete; WS memberi notifikasi agar klien menyegarkan data.
 5. Passphrase/account salt tidak berubah hanya karena sandi akun di web berubah. Reset administrator juga tidak rekey/decrypt vault. Pemulihan akun tidak berarti pemulihan passphrase.
+6. **Mode offline (lease 36 jam):** native client menyimpan `issuedAt`/`expiresAt` authoritative dari `/api/login` dan `/api/me` (server: `CLIENT_SESSION_TTL_SEC`, default & maksimum 129600 detik, tanpa sliding renewal). Snapshot vault disimpan sebagai ciphertext lokal (scoped per server+email+salt) sehingga saat endpoint tidak terjangkau tetapi lease masih berlaku, aplikasi dapat dibuka **read-only**: host tersimpan dapat dipakai untuk SSH/SFTP, sementara tambah/edit/hapus host diblokir. Lease habis → auto logout dan sesi native ditutup; endpoint pulih → snapshot ditarik ulang dan mode tulis aktif kembali hanya setelah sync sukses.
 
 ## Alur SSH/SFTP dan reconnect
 
-- Native membuka `/ws` dengan bearer client dan mengirim pesan `ssh-open` / `sftp-open`. Proxy membuat koneksi upstream memakai `ssh2`, lalu merutekan stdin/stdout/resize atau operasi SFTP berdasarkan tag/channel.
-- Kredensial SSH/private key yang diperlukan untuk upstream dikirim lewat TLS dan **tersedia kepada proxy**. Vault ciphertext-at-rest tidak menyembunyikannya dari server aktif.
-- Klien menampilkan status sync/reconnect dan retry; diagnosis membutuhkan jaringan, TLS, forwarding Upgrade WS, serta revokasi sesi. Setelah Android background/resume, verifikasi koneksi/perangkat nyata; suite unit bukan bukti reconnect sempurna pada semua OS.
+- Desktop dan Android memakai **transport lokal langsung** sebagai jalur utama: `web/android-transport.js` (global `window.tiasshNativeTransport`) di Android dan `desktop/preload.js` + `desktop/transport.js` (IPC `native-transport:send`) di Electron. Pesan tetap memakai kontrak yang sama (`ssh-open`, `ssh-input`, `ssh-resize`, `ssh-close`, `sftp-open`, `sftp-op`, `sftp-close`) dan tag yang sama (`_tag`, `sf:<tab>`), sehingga router `onWsMessage`/`routeMsg` di `web/app.js` tidak berubah.
+- Bila transport lokal tidak tersedia (browser murni, atau bridge gagal dimuat), klien kembali ke `/ws` dengan bearer client; proxy server membuat koneksi upstream memakai `ssh2`.
+- Pada jalur proxy, kredensial SSH/private key dikirim lewat TLS dan **tersedia kepada operator proxy**. Pada jalur transport lokal, kredensial tidak meninggalkan perangkat, tetapi tetap tersimpan terdekripsi di memori aplikasi saat koneksi aktif.
+- Host key: desktop dan Android memakai **TOFU (trust on first use)**; fingerprint pertama disimpan (desktop: `ssh-host-pins.json` di userData; Android: SharedPreferences `ssh-host-keys`), dan key yang berubah ditolak sebelum autentikasi.
+- Klien menampilkan status sync/reconnect dan retry; pada transport lokal, `ssh`/`sftp` tetap berfungsi saat endpoint server mati selama lease sesi belum kedaluwarsa. Diagnosis proxy membutuhkan jaringan, TLS, forwarding Upgrade WS, serta revokasi sesi. Setelah Android background/resume, verifikasi koneksi/perangkat nyata; suite unit bukan bukti reconnect sempurna pada semua OS.
 - Logging/pengujian tidak boleh merekam kredensial, bearer, atau key recovery. Jangan memakai origin header sebagai autentikasi proxy.
 
 ## Deployment, persistence, rollback
