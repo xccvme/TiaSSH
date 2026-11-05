@@ -9,7 +9,12 @@ test('preload exposes only transport methods and never passes IPC event to rende
   const ipc = new EventEmitter(); const sent = [];
   ipc.send = (...args) => sent.push(args);
   let api;
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), { require: () => ({ contextBridge: { exposeInMainWorld(name, value) { assert.equal(name, 'tiasshNativeTransport'); api = value; } }, ipcRenderer: ipc }) });
+  const exposed = {};
+  ipc.invoke = (...args) => Promise.resolve(args);
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), { require: () => ({ contextBridge: { exposeInMainWorld(name, value) { exposed[name] = value; } }, ipcRenderer: ipc }) });
+  assert.deepEqual(Object.keys(exposed).sort(), ['tiasshClipboard', 'tiasshNativeTransport']);
+  assert.deepEqual(Object.keys(exposed.tiasshClipboard).sort(), ['readText', 'writeText']);
+  api = exposed.tiasshNativeTransport;
   assert.throws(() => api.send({ type: 'execute', data: { _tag: 'x' } }), /unsupported/);
   api.send({ type: 'ssh-open', data: { _tag: 'x' } });
   assert.equal(sent[0][0], 'native-transport:send');

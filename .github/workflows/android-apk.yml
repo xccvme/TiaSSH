@@ -1,0 +1,45 @@
+name: Build Android APK
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Capacitor sync
+        working-directory: android
+        run: |
+          npm ci
+          npx cap sync android
+      - name: Gradle assembleDebug
+        working-directory: android/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/TiaSSH-Android.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TiaSSH-Android
+          path: TiaSSH-Android.apk
+      - name: Upload ke Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "TiaSSH $GITHUB_REF_NAME" --notes ""
+          gh release upload "$GITHUB_REF_NAME" TiaSSH-Android.apk --clobber

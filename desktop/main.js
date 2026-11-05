@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, shell, ipcMain, clipboard } = require('electron');
 const path = require('path');
 const { Client } = require('ssh2');
 const { CHANNELS, createTransport } = require('./transport');
@@ -57,6 +57,23 @@ function wireNativeTransport(win) {
   win.webContents.on('will-navigate', event => event.preventDefault());
 }
 
+// Clipboard untuk renderer (dipanggil sekali). Hanya frame utama aplikasi sendiri yang dilayani.
+function wireClipboard() {
+  if (!ipcMain || typeof ipcMain.handle !== 'function' || !clipboard) return;
+  const appEntryUrl = new URL('file://' + path.join(__dirname, 'web', 'index.html')).href;
+  const trusted = event => {
+    const frame = event.senderFrame;
+    const win = BrowserWindow.fromWebContents ? BrowserWindow.fromWebContents(event.sender) : null;
+    return !!win && frame === event.sender.mainFrame && (!frame || !frame.url || frame.url === appEntryUrl);
+  };
+  ipcMain.handle('clipboard:read', event => trusted(event) ? clipboard.readText() : '');
+  ipcMain.handle('clipboard:write', (event, text) => {
+    if (!trusted(event) || typeof text !== 'string' || text.length > 10 * 1024 * 1024) return false;
+    clipboard.writeText(text);
+    return true;
+  });
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -85,6 +102,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
+  wireClipboard();
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

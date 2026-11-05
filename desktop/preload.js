@@ -26,3 +26,12 @@ contextBridge.exposeInMainWorld('tiasshNativeTransport', {
     return () => ipcRenderer.removeListener(eventChannel, listener);
   }
 });
+
+// Clipboard lewat main process: andal di jendela sandbox Electron.
+contextBridge.exposeInMainWorld('tiasshClipboard', {
+  readText() { return ipcRenderer.invoke('clipboard:read'); },
+  writeText(text) {
+    if (typeof text !== 'string') return Promise.reject(new Error('text must be a string'));
+    return ipcRenderer.invoke('clipboard:write', text);
+  }
+});

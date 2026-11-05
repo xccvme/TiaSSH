@@ -769,68 +769,246 @@ function hostModal(existing){
 }
 function closeModal(){ $('modalBg').classList.add('hidden'); }
 
-// ---------- TERMINAL CONTEXT MENU ----------
-function showTerminalContextMenu(x, y, rec, selectedText) {
-  // Remove existing menu
-  const existing = document.querySelector('.term-context-menu');
-  if (existing) existing.remove();
-  
-  const menu = document.createElement('div');
-  menu.className = 'term-context-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  
-  const items = [];
-  
-  if (selectedText) {
-    items.push({ label: '📋 Copy', action: () => {
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(selectedText).then(() => {
-          toast('Copied to clipboard', 'ok');
-        }).catch(() => {});
-      }
-    }});
-  }
-  
-  items.push({ label: '📄 Paste', action: () => {
-    if (navigator.clipboard) {
-      navigator.clipboard.readText().then(text => {
-        if (text && rec.term) {
-          rec.term.paste(text);
-        }
-      }).catch(() => {});
+// ---------- TERMINAL CLIPBOARD + CONTEXT MENU ----------
+// Satu jalur clipboard untuk desktop (Electron IPC), Android WebView, dan browser.
+const termClip = {
+  async write(text){
+    if (!text) return false;
+    const native = window.tiasshClipboard;
+    if (native && typeof native.writeText === 'function') {
+      try { await native.writeText(text); return true; } catch(e) {}
     }
-  }});
-  
-  items.push({ label: '🔄 Clear', action: () => {
-    if (rec.term) rec.term.clear();
-  }});
-  
-  items.forEach(item => {
-    const btn = document.createElement('div');
-    btn.className = 'menu-item';
-    btn.textContent = item.label;
-    btn.onclick = () => {
-      item.action();
-      menu.remove();
-    };
-    menu.appendChild(btn);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); return true; } catch(e) {}
+    }
+    // Fallback lama: textarea sementara + execCommand (masih jalan di WebView lama).
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy'); ta.remove();
+      return !!ok;
+    } catch(e) { return false; }
+  },
+  async read(){
+    const native = window.tiasshClipboard;
+    if (native && typeof native.readText === 'function') {
+      try { return String(await native.readText() || ''); } catch(e) {}
+    }
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      try { return String(await navigator.clipboard.readText() || ''); } catch(e) {}
+    }
+    return null; // tidak diizinkan -> tampilkan dialog tempel manual
+  }
+};
+
+async function termCopy(rec, text){
+  const sel = text != null ? text : (rec.term.hasSelection() ? rec.term.getSelection() : '');
+  if (!sel) { toast('Belum ada teks yang dipilih', 'err'); return false; }
+  const ok = await termClip.write(sel);
+  toast(ok ? 'Tersalin ke clipboard' : 'Gagal menyalin', ok ? 'ok' : 'err');
+  return ok;
+}
+
+async function termPaste(rec){
+  const text = await termClip.read();
+  if (text === null) { showPasteDialog(rec); return; }
+  if (text) rec.term.paste(text);
+  rec.term.focus();
+}
+
+// Dialog tempel manual: dipakai kalau WebView menolak akses baca clipboard.
+function showPasteDialog(rec){
+  closeTermOverlay();
+  const ov = document.createElement('div');
+  ov.className = 'term-overlay';
+  ov.innerHTML = `<div class="term-sheet">
+    <div class="ts-head"><b>Tempel ke terminal</b><button class="btn icon" data-x>✕</button></div>
+    <div class="ts-note">Tekan lama di kotak ini lalu pilih <b>Tempel</b>, kemudian tekan Kirim.</div>
+    <textarea class="ts-text" rows="6" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    <div class="ts-actions"><button class="btn ghost small" data-x>Batal</button><button class="btn small" data-send>Kirim</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+  const ta = ov.querySelector('textarea');
+  ov.querySelectorAll('[data-x]').forEach(b => b.onclick = () => { closeTermOverlay(); rec.term.focus(); });
+  ov.querySelector('[data-send]').onclick = () => {
+    const v = ta.value; closeTermOverlay();
+    if (v) rec.term.paste(v);
+    rec.term.focus();
+  };
+  ov.addEventListener('mousedown', e => { if (e.target === ov) { closeTermOverlay(); rec.term.focus(); } });
+  setTimeout(() => ta.focus(), 30);
+}
+
+// Mode pilih teks: isi layar/scrollback ditampilkan sebagai teks biasa
+// supaya seleksi native (handle tarik di HP) bisa dipakai.
+function showSelectTextView(rec){
+  closeTermOverlay();
+  const buf = rec.term.buffer.active;
+  const lines = [];
+  for (let i = 0; i < buf.length; i++) {
+    const l = buf.getLine(i);
+    if (!l) continue;
+    const s = l.translateToString(true);
+    if (l.isWrapped && lines.length) lines[lines.length - 1] += s; else lines.push(s);
+  }
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  const ov = document.createElement('div');
+  ov.className = 'term-overlay';
+  ov.innerHTML = `<div class="term-sheet wide">
+    <div class="ts-head"><b>Pilih teks</b><button class="btn icon" data-x>✕</button></div>
+    <div class="ts-note">Tekan lama / seret untuk memilih, lalu tekan Salin.</div>
+    <textarea class="ts-text mono" readonly spellcheck="false"></textarea>
+    <div class="ts-actions"><button class="btn ghost small" data-all>Salin semua</button><button class="btn small" data-copy>Salin pilihan</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+  const ta = ov.querySelector('textarea');
+  ta.value = lines.join('\n');
+  ov.querySelectorAll('[data-x]').forEach(b => b.onclick = () => { closeTermOverlay(); rec.term.focus(); });
+  ov.querySelector('[data-all]').onclick = async () => { if (await termCopy(rec, ta.value)) closeTermOverlay(); };
+  ov.querySelector('[data-copy]').onclick = async () => {
+    const t = ta.value.substring(ta.selectionStart, ta.selectionEnd);
+    if (!t) { toast('Pilih teks dulu', 'err'); return; }
+    if (await termCopy(rec, t)) closeTermOverlay();
+  };
+  ov.addEventListener('mousedown', e => { if (e.target === ov) { closeTermOverlay(); rec.term.focus(); } });
+  setTimeout(() => { ta.scrollTop = ta.scrollHeight; }, 0);
+}
+
+function closeTermOverlay(){
+  document.querySelectorAll('.term-overlay').forEach(n => n.remove());
+}
+
+function closeTerminalContextMenu(){
+  const m = document.querySelector('.term-context-menu');
+  if (m) { if (m._cleanup) m._cleanup(); m.remove(); }
+}
+
+function showTerminalContextMenu(x, y, rec){
+  closeTerminalContextMenu();
+  const hasSel = rec.term.hasSelection();
+  const sel = hasSel ? rec.term.getSelection() : '';
+  const touch = isTouchUi();
+  const items = [
+    { label: 'Salin', key: touch ? '' : 'Ctrl+Shift+C', disabled: !hasSel, action: () => termCopy(rec, sel) },
+    { label: 'Tempel', key: touch ? '' : 'Ctrl+V', action: () => termPaste(rec) },
+    { sep: true },
+    { label: 'Pilih semua', action: () => { rec.term.selectAll(); } },
+  ];
+  if (touch) items.push({ label: 'Pilih teks…', action: () => showSelectTextView(rec) });
+  items.push({ sep: true }, { label: 'Bersihkan layar', action: () => { rec.term.clear(); rec.term.focus(); } });
+
+  const menu = document.createElement('div');
+  menu.className = 'term-context-menu' + (touch ? ' touch' : '');
+  menu.setAttribute('role', 'menu');
+  items.forEach(it => {
+    if (it.sep) { const s = document.createElement('div'); s.className = 'menu-sep'; menu.appendChild(s); return; }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'menu-item';
+    b.setAttribute('role', 'menuitem');
+    b.disabled = !!it.disabled;
+    b.innerHTML = `<span>${esc(it.label)}</span>${it.key ? `<kbd>${esc(it.key)}</kbd>` : ''}`;
+    // mousedown di-preventDefault supaya fokus & seleksi terminal tidak hilang sebelum aksi.
+    b.addEventListener('mousedown', e => e.preventDefault());
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      if (b.disabled) return;
+      closeTerminalContextMenu();
+      it.action();
+    });
+    menu.appendChild(b);
   });
-  
+  menu.style.visibility = 'hidden';
   document.body.appendChild(menu);
-  
-  // Close on click outside
-  setTimeout(() => {
-    const closeMenu = (e) => {
-      if (!menu.contains(e.target)) {
-        menu.remove();
-        document.removeEventListener('click', closeMenu);
-        document.removeEventListener('touchstart', closeMenu);
-      }
-    };
-    document.addEventListener('click', closeMenu);
-    document.addEventListener('touchstart', closeMenu);
-  }, 100);
+  // Jaga menu tetap di dalam layar.
+  const r = menu.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  menu.style.left = Math.max(6, Math.min(x, vw - r.width - 6)) + 'px';
+  menu.style.top = Math.max(6, Math.min(y, vh - r.height - 6)) + 'px';
+  menu.style.visibility = '';
+
+  const outside = e => { if (!menu.contains(e.target)) closeTerminalContextMenu(); };
+  const onKey = e => {
+    if (e.key !== 'Escape') return;
+    // Jangan sampai Esc ikut terkirim ke shell remote.
+    e.preventDefault(); e.stopPropagation();
+    closeTerminalContextMenu(); rec.term.focus();
+  };
+  const onBlur = () => closeTerminalContextMenu();
+  // Ditunda satu tick supaya event pembuka menu tidak langsung menutupnya.
+  const t = setTimeout(() => {
+    document.addEventListener('pointerdown', outside, true);
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('resize', onBlur);
+  }, 0);
+  menu._cleanup = () => {
+    clearTimeout(t);
+    document.removeEventListener('pointerdown', outside, true);
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('blur', onBlur);
+    window.removeEventListener('resize', onBlur);
+  };
+}
+
+function isTouchUi(){
+  try { return !!(window.matchMedia && window.matchMedia('(pointer:coarse)').matches) || isMobile(); }
+  catch(e){ return isMobile(); }
+}
+
+// Pasang perilaku clipboard ke satu terminal.
+function wireTerminalClipboard(rec){
+  const term = rec.term, el = rec.termDiv;
+  term.attachCustomKeyEventHandler(ev => {
+    if (ev.type !== 'keydown') return true;
+    const k = String(ev.key || '').toLowerCase();
+    const mod = ev.ctrlKey || ev.metaKey;
+    // Copy: Ctrl+Shift+C selalu; Ctrl+C hanya kalau ada seleksi (kalau tidak, kirim ^C ke server).
+    if (mod && !ev.altKey && k === 'c' && (ev.shiftKey || term.hasSelection())) {
+      ev.preventDefault();
+      if (term.hasSelection()) { termCopy(rec); if (!ev.shiftKey) term.clearSelection(); }
+      return false;
+    }
+    // Paste: JANGAN baca clipboard manual. Kembalikan false supaya xterm tidak kirim ^V,
+    // lalu event 'paste' bawaan browser yang memasukkan teks — tepat satu kali.
+    if (mod && !ev.altKey && k === 'v') return false;
+    if (ev.shiftKey && k === 'insert') return false;
+    return true;
+  });
+
+  // Klik kanan -> menu. (Klik kiri + seret = seleksi bawaan xterm, dobel klik = kata, tripel = baris.)
+  let lastMenuAt = 0;
+  el.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (Date.now() - lastMenuAt < 600) return; // long-press sudah membuka menu
+    lastMenuAt = Date.now();
+    showTerminalContextMenu(e.clientX, e.clientY, rec);
+  });
+
+  // Tekan lama di layar sentuh -> menu.
+  let pressTimer = null, startX = 0, startY = 0;
+  const cancel = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
+  el.addEventListener('touchstart', e => {
+    cancel();
+    if (e.touches.length !== 1) return;
+    startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      if (Date.now() - lastMenuAt < 600) return;
+      lastMenuAt = Date.now();
+      showTerminalContextMenu(startX, startY, rec);
+    }, 500);
+  }, { passive: true });
+  el.addEventListener('touchmove', e => {
+    if (!pressTimer || !e.touches.length) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) cancel();
+  }, { passive: true });
+  el.addEventListener('touchend', cancel, { passive: true });
+  el.addEventListener('touchcancel', cancel, { passive: true });
 }
 
 // ---------- TABS ----------
@@ -870,54 +1048,8 @@ function openTab(host){
   rec.viewSwitch = vs;
   vs.querySelectorAll('button').forEach(b => b.onclick = () => setView(rec, b.dataset.v));
   
-  // Clipboard support - modern approach with context menu
-  let lastSelection = '';
-  
-  // Keyboard shortcuts
-  term.attachCustomKeyEventHandler(ev => {
-    if (ev.ctrlKey && ev.key === 'c' && term.hasSelection()) {
-      const sel = term.getSelection();
-      if (sel && navigator.clipboard) {
-        navigator.clipboard.writeText(sel).catch(() => {});
-      }
-      return false;
-    }
-    if (ev.ctrlKey && ev.key === 'v') {
-      if (navigator.clipboard) {
-        navigator.clipboard.readText().then(text => {
-          if (text) term.paste(text);
-        }).catch(() => {});
-      }
-      return false;
-    }
-    return true;
-  });
-  
-  // Track selection (don't auto-copy on every change to avoid paste duplication)
-  term.onSelectionChange(() => {
-    lastSelection = term.getSelection();
-  });
-  
-  // Right-click & long-press context menu
-  let pressTimer = null;
-  termDiv.addEventListener('contextmenu', e => {
-    e.preventDefault();
-    showTerminalContextMenu(e.clientX, e.clientY, rec, lastSelection);
-  });
-  termDiv.addEventListener('touchstart', e => {
-    if (e.touches.length === 1) {
-      pressTimer = setTimeout(() => {
-        const touch = e.touches[0];
-        showTerminalContextMenu(touch.clientX, touch.clientY, rec, lastSelection);
-      }, 500);
-    }
-  });
-  termDiv.addEventListener('touchend', () => {
-    if (pressTimer) clearTimeout(pressTimer);
-  });
-  termDiv.addEventListener('touchmove', () => {
-    if (pressTimer) clearTimeout(pressTimer);
-  });
+  // Copy/paste: keyboard, klik kanan, tekan lama (HP)
+  wireTerminalClipboard(rec);
 
   activateTab(host.id);
   connectSsh(rec);
